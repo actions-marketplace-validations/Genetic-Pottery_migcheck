@@ -154,6 +154,7 @@ migrations when `SKIP_POST_DEPLOYMENT_MIGRATIONS` is set.
 | `--head-name` | Name to show for `--head` in the result, such as `this pull request`. |
 | `--markdown` | Also write the result as Markdown to this path, for a pull request comment. |
 | `--require-workload-success` | Exit with code `2` if the workload command fails, instead of checking the queries it ran. |
+| `--version` | Print migcheck's version and exit. |
 
 ## See it in action
 

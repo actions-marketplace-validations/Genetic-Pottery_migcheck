@@ -8,6 +8,7 @@ that works on the old schema and fails on the new one breaks production.
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,7 @@ MARKDOWN = None
 
 def main():
     parser = argparse.ArgumentParser(prog="migcheck", description=(__doc__ or "").splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_version()}")
     parser.add_argument("--repo", default=".", help="git repository to check (default: .)")
     parser.add_argument("--base", required=True, help="ref of the release running in production")
     parser.add_argument("--head", required=True, help="ref of the release being deployed")
@@ -269,6 +271,23 @@ def fail(msg):
     if MARKDOWN:
         _write_markdown([MARKER, "### migcheck: couldn't compare", "", "```", msg, "```"])
     sys.exit(2)
+
+
+def _version():
+    # The GitHub Action runs migcheck from a checkout without installing it,
+    # so a checkout's pyproject.toml comes first. Installed packages have no
+    # pyproject.toml next to them.
+    pyproject = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pyproject.toml")
+    if os.path.isfile(pyproject):
+        with open(pyproject) as f:
+            match = re.search(r'^version = "(.+)"$', f.read(), re.M)
+        if match:
+            return match.group(1)
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        return version("migcheck")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 def step(msg):

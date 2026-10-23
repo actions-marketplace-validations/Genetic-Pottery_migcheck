@@ -1,11 +1,13 @@
 # Test results
 
 These results come from running migcheck against real upgrades of open-source
-apps. Each run used the app's own test suite as the workload.
+apps. Each run used the app's own test suite as the workload. All results
+reflect migcheck 0.2.0. When a release changes how migcheck records or replays
+queries, the affected results are rerun.
 
 | App | ORM | Database | Upgrades | Result |
 |---|---|---|---|---|
-| A Django app | Django | Postgres | 25 migrations | Caught 6 of 9 breaks |
+| Plane | Django | Postgres | 25 migrations | Caught 6 of 9 breaks |
 | Gitea | xorm (Go) | Postgres, MySQL | 2 | Caught the 1 break |
 | Ghost | Knex (Node) | MySQL | 2 | Caught all 3 breaks |
 | Keycloak | Hibernate (Java) | Postgres, MySQL | 2 | Caught all 3 breaks |
@@ -13,11 +15,11 @@ apps. Each run used the app's own test suite as the workload.
 
 No run raised a false alarm, after the fix described in the Mastodon section.
 
-## Django
+## Plane
 
-migcheck checked 25 migrations from an open-source Django app's history. It
-caught 6 of the 9 breaking migrations. It missed the other 3 because the app's
-tests never queried the changed tables.
+migcheck checked 25 migrations from Plane's history. It caught 6 of the 9
+breaking migrations. It missed the other 3 because Plane's tests never queried
+the changed tables.
 
 ## Gitea
 
