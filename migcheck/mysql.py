@@ -12,7 +12,7 @@ import subprocess
 import time
 import uuid
 
-from .common import Statement
+from .common import Statement, column_owner
 from .common import run as _run
 
 DEFAULT_IMAGE = "mysql:8.4"
@@ -46,6 +46,13 @@ DDL = re.compile(r"^\s*(CREATE|ALTER|DROP|RENAME|GRANT|REVOKE)\b", re.IGNORECASE
 # so replay empties the table only if it exists, ignoring foreign keys.
 TRUNCATE = re.compile(r"^\s*TRUNCATE\s+(?:TABLE\s+)?((?:`[^`]+`|[\w$]+)(?:\.(?:`[^`]+`|[\w$]+))?)\s*;?\s*$", re.IGNORECASE)
 ERROR = re.compile(r"^ERROR (\d+) \(\w+\) at line (\d+): (.*)$")
+
+# Errors that name the schema object a statement used, so the report can
+# group a dropped column's errors together however each statement named it.
+UNKNOWN_COLUMN = re.compile(r"^Unknown column '(?:(.+)\.)?([^.']+)' in ")
+NO_DEFAULT = re.compile(r"^(?:Field '(.+)' doesn't have a default value|Column '(.+)' cannot be null)$")
+NO_TABLE = re.compile(r"^Table '(?:[^.']+\.)?(.+)' doesn't exist$")
+NO_FUNCTION = re.compile(r"^FUNCTION (?:[^.\s]+\.)?(\S+) does not exist$")
 
 INTEGRITY_ERRORS = {"1022", "1048", "1062", "1169", "1216", "1217", "1364", "1451", "1452", "1557", "1586", "3819"}
 FOREIGN_KEY_ERRORS = {"1216", "1217", "1451", "1452"}
@@ -141,6 +148,22 @@ class MySQL:
         _run(self._client("-e", "SET GLOBAL general_log = ON"))
 
     @staticmethod
+    def cause(msg, sql):
+        """Returns the table, column, or function that an error says is
+        missing or changed, such as "users.name", or None."""
+        if m := UNKNOWN_COLUMN.match(msg):
+            table = column_owner(sql, m.group(1), fold=False)
+            return table and f"{table}.{m.group(2)}"
+        if m := NO_DEFAULT.match(msg):
+            table = column_owner(sql, None, fold=False)
+            return table and f"{table}.{m.group(1) or m.group(2)}"
+        if m := NO_TABLE.match(msg):
+            return m.group(1)
+        if m := NO_FUNCTION.match(msg):
+            return f"{m.group(1)}()"
+        return None
+
+    @staticmethod
     def is_integrity_error(state):
         return state in INTEGRITY_ERRORS
 
@@ -166,7 +189,12 @@ class MySQL:
             raise RuntimeError(f"reading the MySQL log failed with exit code {proc.returncode}")
         return statements
 
-    def replay(self, db, statements):
+    def mark(self):
+        """MySQL doesn't record which transaction wrote a row, so replay can't
+        tell rows from the head migrations apart. Returns None."""
+        return None
+
+    def replay(self, db, statements, migrated_after=None):
         """Runs each statement in order and returns a list of (error code, message).
 
         A statement that succeeds keeps its effects until the end of its

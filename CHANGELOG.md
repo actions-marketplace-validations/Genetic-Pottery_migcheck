@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.3.0 - 2026-10-25
+
+### Added
+
+- `RECIPES.md` shows how to set up migcheck for TypeORM, tested with n8n.
+- `EVIDENCE.md` includes the n8n test, which found a false alarm when a
+  migration inserts rows that the old release inserts only if they're missing.
+- `RECIPES.md` shows how to set up migcheck for Diesel, tested with Lemmy, and
+  how to give replay the settings an app passes in its connection string.
+- `EVIDENCE.md` includes the Lemmy test.
+- `RECIPES.md` shows how to set up migcheck for Ecto, and `EVIDENCE.md`
+  includes the Akkoma test.
+- `RECIPES.md` shows how to set up migcheck for Laravel, and `EVIDENCE.md`
+  includes the BookStack test on MySQL.
+- `RECIPES.md` shows how to set up migcheck for Entity Framework, and
+  `EVIDENCE.md` includes the Bitwarden test.
+- `RECIPES.md` shows how to set up migcheck for Prisma, and `EVIDENCE.md`
+  includes the Cal.com test.
+- `RECIPES.md` shows how to set up migcheck for Sequelize, and `EVIDENCE.md`
+  includes the Outline test.
+
+### Changed
+
+- The report groups breaking statements by the table, column, or function
+  that each error names, such as `users.name`, and starts with a list of
+  these causes and how many statements each one breaks. Before, one dropped
+  column could appear as several groups, because a read's error names the
+  query's alias for the table, and writes word the error differently. Errors
+  that name nothing migcheck can resolve stay groups of their own.
+- On Postgres, when an insert breaks because a row from the head release's
+  migrations holds its key, the report says so. The insert isn't a break if
+  the base release checks for the row before inserting it, which replay can't
+  see. The result still fails.
+
+### Fixed
+
+- On Postgres, an apostrophe in an SQL comment, such as "won't", no longer
+  stops migcheck from filling in the statement's later parameters. Neither
+  does a backslash-escaped quote in an `E''` string. Those statements failed
+  on both schemas and weren't checked.
+- On Postgres, filling in parameters takes time in proportion to the
+  statement's length. It took time in proportion to the square of the length,
+  which slowed bulk inserts with thousands of parameters.
+- On Postgres, replay runs `DISCARD ALL` as `SET SESSION AUTHORIZATION
+  DEFAULT; RESET ALL`. Connection pools, such as Npgsql's, send `DISCARD ALL`
+  when the app returns a connection, and it can't run in a transaction. It
+  failed on both schemas and made up to 46% of the statements in a run, so
+  the report warned that migcheck hadn't checked them.
+- On Postgres, a session reset or a rolled-back first transaction no longer
+  turns off the note on keys that a head migration inserted.
+
 ## v0.2.1 - 2026-10-23
 
 ### Added

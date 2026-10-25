@@ -16,6 +16,7 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 
+from .common import MIGRATED_KEY
 from .mysql import MySQL
 from .postgres import Postgres
 
@@ -83,12 +84,13 @@ def main():
         step(f"Applying {args.head} migrations")
         db.create_db("mc_old", template="mc_template")
         db.create_db("mc_new", template="mc_template")
+        migrated_after = db.mark()
         _sh(args.migrate, head_dir, db.url("mc_new"))
         schema_changed = db.schema("mc_old") != db.schema("mc_new")
 
         step(f"Replaying {len(statements)} statements against both schemas")
         old = db.replay("mc_old", statements)
-        new = db.replay("mc_new", statements)
+        new = db.replay("mc_new", statements, migrated_after)
     except Exception as e:  # Exit code 1 means a query breaks, so nothing else may use it.
         fail(f"{type(e).__name__}: {e}")
     finally:
@@ -112,7 +114,9 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
             f"First error: [{old[0][0]}] {old[0][1]}"
         )
     roots, knock_on = _classify(db, statements, old, new)
+    groups = _group(db, roots)
     count = sum(len(v) for v in roots.values())
+    causes = f"{len(groups)} cause{'s' if len(groups) != 1 else ''}"
     checked = len(statements) - skipped
     # Each note is (level, text, Markdown text). A workload that stopped early
     # can pass without having run the queries that break, so a pass then
@@ -149,12 +153,25 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
     elif not roots:
         print(f"PASS: all {checked} statements from {base} still work after {head}'s migrations.")
     else:
-        print(f"FAIL: {count} statements from {base} break after {head}'s migrations.\n")
-        for (state, msg), stmts in roots.items():
-            print(f"  [{state}] {msg}")
+        print(f"FAIL: {count} statements from {base} break after {head}'s migrations, from {causes}:")
+        width = min(40, max(len(_label(c, e)) for c, e in groups))
+        for cause, errors in groups:
+            print(f"    {_label(cause, errors):<{width}}  {sum(len(v) for v in errors.values())} statements")
+        print()
+        for cause, errors in groups:
+            stmts = [s for v in errors.values() for s in v]
+            if cause:
+                print(f"  {cause}")
+                for (state, msg), v in errors.items():
+                    print(f"      [{state}] {msg} ({len(v)})")
+            else:
+                (state, msg), = errors
+                print(f"  [{state}] {msg}")
             print(f"      {len(stmts)} statements in {_blocks(stmts)} transactions. Examples:")
             for sql in _examples(stmts, 160):
                 print(f"      {sql}")
+            if any(msg.endswith(MIGRATED_KEY) for _, msg in errors):
+                print(f"      {_migrated_key_note(base, head)}")
             print()
         if knock_on:
             print("  Later failures in the same transactions, likely caused by the errors above:")
@@ -175,17 +192,35 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
             md.append("### migcheck: FAIL")
             md.append("")
             md.append(
-                f"{count:,} statements from `{base}` break after {head_md}'s migrations. "
+                f"{count:,} statements from `{base}` break after {head_md}'s migrations, from {causes}. "
                 f"`{base}` fails during a rolling deploy of {head_md}, and after a rollback to `{base}`."
             )
-            for (state, msg), stmts in roots.items():
+            md.append("")
+            md.append("| Cause | Statements |")
+            md.append("|---|---|")
+            for cause, errors in groups:
+                label = f"`{cause}`" if cause else _md_escape(_label(cause, errors))
+                md.append(f"| {label.replace('|', '&#124;')} | {sum(len(v) for v in errors.values()):,} |")
+            for cause, errors in groups:
+                stmts = [s for v in errors.values() for s in v]
                 md.append("")
-                md.append(f"**`{state}` {_md_escape(msg)}**")
+                if cause:
+                    md.append(f"**`{cause}`**")
+                    md.append("")
+                    for (state, msg), v in errors.items():
+                        md.append(f"- `{state}` {_md_escape(msg)} ({len(v):,})")
+                    md.append("")
+                else:
+                    (state, msg), = errors
+                    md.append(f"**`{state}` {_md_escape(msg)}**")
                 md.append(f"{len(stmts):,} statements in {_blocks(stmts):,} transactions. Examples:")
                 md.append("")
                 md.append("```sql")
                 md.extend(_examples(stmts, 500))
                 md.append("```")
+                if any(msg.endswith(MIGRATED_KEY) for _, msg in errors):
+                    md.append("")
+                    md.append(_migrated_key_note(f"`{base}`", head_md))
             if knock_on:
                 md.append("")
                 md.append("<details><summary>Later failures in the same transactions, likely caused by the errors above</summary>")
@@ -234,6 +269,38 @@ def _classify(db, statements, old, new):
         broken_blocks.add(s.block)
         roots[key].append(s)
     return roots, knock_on
+
+
+def _group(db, roots):
+    """Groups the breaking statements by the table, column, or function that
+    each one's error names, so a dropped column is one cause however each
+    statement referred to it. Returns [(name, {(state, msg): statements})],
+    largest first. An error that names nothing migcheck can resolve is a
+    cause of its own, with None for its name."""
+    groups = {}
+    for key, stmts in roots.items():
+        for s in stmts:
+            name = db.cause(key[1], s.sql)
+            groups.setdefault(name or key, {}).setdefault(key, []).append(s)
+    grouped = [
+        (name if isinstance(name, str) else None, dict(sorted(errors.items(), key=lambda e: -len(e[1]))))
+        for name, errors in groups.items()
+    ]
+    return sorted(grouped, key=lambda g: -sum(len(v) for v in g[1].values()))
+
+
+def _label(cause, errors):
+    if cause:
+        return cause
+    (state, msg), = errors
+    return f"[{state}] {msg[:60]}{'...' if len(msg) > 60 else ''}"
+
+
+def _migrated_key_note(base, head):
+    return (
+        f"{head}'s migrations inserted a row with this key. If {base} checks for the row before "
+        "inserting it, as code that seeds missing rows does, this isn't a break."
+    )
 
 
 def _skip_reasons(old, limit=5):

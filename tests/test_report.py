@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from migcheck import __main__ as cli
-from migcheck.common import Statement
+from migcheck.common import MIGRATED_KEY, Statement
 from migcheck.postgres import Postgres
 
 OK = (None, None)
@@ -70,9 +70,49 @@ class ReportTest(unittest.TestCase):
         statements = [Statement("SELECT name FROM users", 0, True), Statement("SELECT 1", 1, True)]
         code, out = run_report(statements, [OK, OK], [("42703", 'column "name" does not exist'), OK])
         self.assertEqual(code, 1)
-        self.assertIn("FAIL: 1 statements from v1 break after v2's migrations.", out)
-        self.assertIn('[42703] column "name" does not exist', out)
+        self.assertIn("FAIL: 1 statements from v1 break after v2's migrations, from 1 cause:", out)
+        self.assertIn("    users.name  1 statements\n", out)
+        self.assertIn('[42703] column "name" does not exist (1)', out)
         self.assertIn("SELECT name FROM users", out)
+
+    def test_merges_the_errors_for_one_column(self):
+        statements = [
+            Statement("INSERT INTO users (name) VALUES ('a')", 0, True),
+            Statement("SELECT u0.name FROM users AS u0", 1, True),
+            Statement("SELECT u1.name FROM users u1", 2, True),
+            Statement("INSERT INTO teams (owner) VALUES (1)", 3, True),
+        ]
+        new = [
+            ("42703", 'column "name" of relation "users" does not exist'),
+            ("42703", "column u0.name does not exist"),
+            ("42703", "column u1.name does not exist"),
+            ("42P10", "there is no unique or exclusion constraint matching the ON CONFLICT specification"),
+        ]
+        code, out = run_report(statements, [OK] * 4, new)
+        self.assertEqual(code, 1)
+        self.assertIn("from 2 causes:\n    users.name ", out)
+        self.assertIn("  users.name\n      [42703] column", out)
+        self.assertIn("      3 statements in 3 transactions. Examples:", out)
+        self.assertIn("  [42P10] there is no unique", out)
+
+    def test_splits_one_alias_that_names_two_tables(self):
+        statements = [
+            Statement('SELECT a."Status" FROM "AccessRequest" AS a', 0, True),
+            Statement('SELECT a."Status" FROM "AccessLease" AS a', 1, True),
+        ]
+        new = [("42703", "column a.Status does not exist")] * 2
+        _, out = run_report(statements, [OK, OK], new)
+        self.assertIn("from 2 causes:", out)
+        self.assertIn("  AccessRequest.Status\n", out)
+        self.assertIn("  AccessLease.Status\n", out)
+
+    def test_lists_the_largest_cause_first(self):
+        statements = [Statement("SELECT f(1)", i, True) for i in range(3)]
+        new = [("42P01", 'relation "posts" does not exist'),
+               ("42883", "function f(integer) does not exist"),
+               ("42883", "function f(unknown) does not exist")]
+        _, out = run_report(statements, [OK] * 3, new)
+        self.assertRegex(out, r"from 2 causes:\n    f\(\)\s+2 statements\n    posts\s+1 statements")
 
     def test_reports_skipped_statements_and_workload_exit(self):
         statements = [Statement("a", 0, True), Statement("b", 1, True)]
@@ -146,10 +186,22 @@ class ReportTest(unittest.TestCase):
             with open(cli.MARKDOWN) as f:
                 md = f.read()
         self.assertTrue(md.startswith(cli.MARKER + "\n### migcheck: FAIL\n"))
-        self.assertIn("1 statements from `v1` break after this pull request's migrations.", md)
+        self.assertIn("1 statements from `v1` break after this pull request's migrations, from 1 cause.", md)
+        self.assertIn("| Cause | Statements |\n|---|---|\n| [42703] column &lt;a\\_b> missing | 1 |", md)
         self.assertIn("**`42703` column &lt;a\\_b> missing**", md)
         self.assertIn("```sql\nSELECT a_b FROM t\n```", md)
         self.assertIn("- `23502` null value (1)", md)
+
+    def test_explains_keys_that_a_migration_inserted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli.MARKDOWN = os.path.join(tmp, "result.md")
+            new = [("23505", "duplicate key" + MIGRATED_KEY)]
+            code, out = run_report([Statement("INSERT", 0, True)], [OK], new)
+            with open(cli.MARKDOWN) as f:
+                md = f.read()
+        self.assertEqual(code, 1)
+        self.assertIn("v2's migrations inserted a row with this key. If v1 checks", out)
+        self.assertIn("`v2`'s migrations inserted a row with this key. If `v1` checks", md)
 
     def test_markdown_lists_skip_reasons(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,9 +1,12 @@
 # Test results
 
 These results come from running migcheck against real upgrades of open-source
-apps. Each run used the app's own test suite as the workload. All results
-reflect migcheck 0.2.0. When a release changes how migcheck records or replays
-queries, the affected results are rerun.
+apps. Each run used the app's own test suite as the workload. The Postgres
+results and the BookStack results reflect migcheck 0.3.0. The MySQL results
+for Ghost, Gitea, and Keycloak reflect migcheck 0.2.0, because migcheck's
+MySQL replay hasn't changed since then. Rerunning the older Postgres results
+with 0.3.0 gave the same verdicts. When a release changes how migcheck
+records or replays queries, the affected results are rerun.
 
 | App | ORM | Database | Upgrades | Result |
 |---|---|---|---|---|
@@ -12,8 +15,16 @@ queries, the affected results are rerun.
 | Ghost | Knex (Node) | MySQL | 2 | Caught all 3 breaks |
 | Keycloak | Hibernate (Java) | Postgres, MySQL | 2 | Caught all 3 breaks |
 | Mastodon | Active Record (Rails) | Postgres | 2 | Passed both, as designed |
+| n8n | TypeORM (Node) | Postgres | 2 | Caught the 1 break, with 1 false alarm |
+| Lemmy | Diesel (Rust) | Postgres | 2 | Caught the 1 break |
+| Akkoma | Ecto (Elixir) | Postgres | 2 | Caught all 4 breaks |
+| BookStack | Laravel (PHP) | MySQL | 4 | Caught all 4 breaks |
+| Bitwarden | Entity Framework (.NET) | Postgres | 4 | Caught all 5 breaks |
+| Cal.com | Prisma (Node) | Postgres | 3 | Caught 1 of 2 breaks |
+| Outline | Sequelize (Node) | Postgres | 3 | Caught the 1 break |
 
-No run raised a false alarm, after the fix described in the Mastodon section.
+The n8n run raised the only false alarm left after the fix described in the
+Mastodon section. For details, see the n8n section.
 
 ## Plane
 
@@ -89,9 +100,9 @@ replayed v4.6.9 to v4.7.3 with all migrations applied.
 
 | Upgrade | Migrations | Statements | Result |
 |---|---|---|---|
-| v4.5.19 to v4.6.9 | Pre-deployment | 215,330 | Pass |
-| v4.6.9 to v4.7.3 | Pre-deployment | 237,781 | Pass |
-| v4.6.9 to v4.7.3 | All | 237,583 | Fail |
+| v4.5.19 to v4.6.9 | Pre-deployment | 213,180 | Pass |
+| v4.6.9 to v4.7.3 | Pre-deployment | 237,257 | Pass |
+| v4.6.9 to v4.7.3 | All | 234,771 | Fail |
 
 Both pre-deployment runs passed, as Mastodon's design intends. The run with
 all migrations failed on two post-deployment changes:
@@ -112,3 +123,245 @@ insert a new key when a migration already took its key.
 The workload skipped Mastodon's browser specs and search specs. 14 of the
 remaining 7,121 specs failed, because the Redis configuration specs expect a
 default Redis URL. Those specs don't query the database.
+
+## n8n
+
+migcheck replayed n8n's CLI integration tests on Postgres for two upgrades,
+2.40.6 to 2.41.7 and 2.44.6 to 2.45.3.
+
+| Upgrade | Statements | Result |
+|---|---|---|
+| 2.40.6 to 2.41.7 | 486,810 | Fail |
+| 2.44.6 to 2.45.3 | 625,107 | Pass |
+
+migcheck caught the one break in 2.41.7. That release adds
+`ai_preference.source` as `NOT NULL` with no default, on purpose, so that every
+write must name its source. 2.40.6's 37 inserts into `ai_preference` don't set
+it. The 2.45.3 migrations add columns with defaults, drop a `NOT NULL`, and add
+a check that 2.44.6's rows meet, so migcheck passed it.
+
+The 2.41.7 run also raised a false alarm. A 2.41.7 migration inserts three rows
+into the `scope` table. At startup, 2.40.6 reads the `scope` table and inserts
+the scopes that are missing. Replay runs the recorded insert, which includes
+the three scopes the migration added, so it fails on the primary key. A real
+2.40.6 server reads the table first and skips those scopes. The insert also
+caused 227 later failures in the same transaction, which the report lists
+separately.
+
+migcheck still fails this insert, because an old release that inserts without
+checking first breaks in production. The report labels it: it says that a row
+from the head migrations holds the key, and that the insert isn't a break if
+the old release checks for the row first.
+
+Each run passed about 7,000 to 8,600 tests. 4 tests failed in each run, at
+least 2 of them because `openssl` wasn't installed.
+
+## Lemmy
+
+migcheck replayed Lemmy's Rust tests on Postgres for two upgrades,
+1.0.0-beta.0 to 1.0.0-beta.1 and 1.0.0-beta.1 to 1.0.0-beta.2.
+
+| Upgrade | Statements | Result |
+|---|---|---|
+| 1.0.0-beta.0 to 1.0.0-beta.1 | 20,663 | Fail |
+| 1.0.0-beta.1 to 1.0.0-beta.2 | 21,561 | Pass |
+
+migcheck caught the one break in 1.0.0-beta.1. That release renames
+`local_user.hide_media` to `hide_posts_with_media`. Diesel names every column
+in its queries, so 445 of 1.0.0-beta.0's statements break: inserts and
+updates of `local_user`, and the reads that join it, such as the post and
+comment views.
+
+1.0.0-beta.2 renames a column too, but the column is new in that release, so
+1.0.0-beta.1 never uses it. migcheck passed it.
+
+Lemmy sets `lemmy.protocol_and_hostname` as an option in its connection
+string, and its triggers read the setting. The Postgres log doesn't record
+connection options, so in the first runs, replay ran without the setting. 1,685
+statements failed on both schemas and weren't checked. The runs in the table
+set the option on the `postgres` role, and 60 statements failed on both
+schemas. The verdicts didn't change.
+
+Each run passed 270 to 280 tests. 2 tests failed in each run, because they
+fetch pages from the internet. In one run of 1.0.0-beta.0's tests, 32 tests
+failed on a duplicate person name, and the run recorded fewer statements. The
+table shows the next run, which had the usual 2 failures.
+
+## Akkoma
+
+migcheck replayed Akkoma's tests on Postgres for two upgrades, v3.18.1 to
+v3.19.0 and v3.19.0 to v3.20.1. Akkoma is a fork of Pleroma.
+
+| Upgrade | Statements | Result |
+|---|---|---|
+| v3.18.1 to v3.19.0 | 76,358 | Fail |
+| v3.19.0 to v3.20.1 | 74,285 | Pass |
+
+migcheck caught all four breaks in v3.19.0, in 21,781 statements:
+
+- v3.19.0 drops `users.skip_thread_containment`. Ecto names every field in
+  its queries, so most of v3.18.1's reads and writes of `users` break.
+- v3.19.0 drops `lists.ap_id`, which v3.18.1 reads and writes.
+- v3.19.0 drops the `activity_visibility` and `thread_visibility` functions,
+  which v3.18.1's timeline queries call.
+
+v3.20.1's migrations add a column, replace indexes, and backfill data, so
+migcheck passed it. v3.20.1 also replaces the unique index on
+`users.nickname` with one under another name. v3.19.0 maps the old index's
+name to a "nickname taken" error, so a duplicate nickname raises an exception
+instead. The insert fails on both schemas, so migcheck doesn't catch this.
+The tests didn't insert a duplicate nickname, so the run didn't show it.
+
+Ecto's test sandbox runs each test in a transaction that it rolls back, and
+turns the test's own transactions into savepoints. Replay rolls back each
+test's transaction too, but it ignores savepoints, so it doesn't undo a
+rollback to a savepoint. Only 18 statements failed on both schemas, so this
+didn't cost the run any data that later queries needed.
+
+This test found a bug in migcheck. One of Akkoma's queries has a comment with
+"won't" in it, and migcheck read the apostrophe as the start of a string. It
+left the query's later parameters unfilled, so the query failed on both
+schemas. migcheck now skips comments.
+
+Each run passed about 4,150 tests, and 1 to 3 tests failed in each. The first run of
+v3.18.1's tests under migcheck had 96 failures, which didn't happen again
+with the same random seed.
+
+## BookStack
+
+migcheck replayed BookStack's PHPUnit tests on MySQL for four upgrades. Each
+workload ran BookStack's seeder, then its tests.
+
+| Upgrade | Statements | Result |
+|---|---|---|
+| v24.02.3 to v24.05.4 | 56,572 | Fail |
+| v25.07.3 to v25.11.6 | 60,536 | Fail |
+| v25.11.6 to v25.12.9 | 65,319 | Pass |
+| v26.05.5 to v26.09.2 | 75,951 | Pass |
+
+migcheck caught the one break in v24.05.4, in 890 statements. v24.05.4
+renames `activities.entity_id` and `activities.entity_type`, which v24.02.3
+writes and filters on.
+
+migcheck caught all three breaks in v25.11.6, in 16,298 statements:
+
+- v25.11.6 merges the `books`, `chapters`, `pages`, and `bookshelves` tables
+  into one `entities` table and drops the old tables.
+- v25.11.6 renames `comments.entity_id` and `comments.entity_type`.
+- v25.11.6 drops `comments.text`, which v25.07.3 writes.
+
+v25.11.6 also drops two `role_permissions` columns that v25.07.3 doesn't
+use, so they aren't breaks.
+
+v25.12.9's migrations add two tables and an index, so migcheck passed it.
+v26.09.2 has no migrations of its own: BookStack backported its only one to
+v26.05.3. migcheck passed it and noted that the schema didn't change.
+
+No statement failed on both schemas in any run. The tests ran in a PHP 8.3
+image. In two runs, one or two image thumbnail tests failed because of the
+image's GD build. The other tests passed.
+
+## Bitwarden
+
+migcheck replayed the Postgres tests in Bitwarden server's
+`Infrastructure.IntegrationTest` project for four upgrades. Those tests run
+Bitwarden's Entity Framework repositories against a real database. Bitwarden's
+other tests use SQLite in memory, so they can't serve as a workload.
+
+| Upgrade | Statements | Result |
+|---|---|---|
+| v2026.4.2 to v2026.5.0 | 8,653 | Pass |
+| v2026.5.0 to v2026.6.2 | 5,996 | Pass |
+| v2026.6.2 to v2026.7.2 | 6,750 | Fail |
+| v2026.9.2 to v2026.10.0 | 10,626 | Fail |
+
+migcheck caught both breaks in v2026.7.2, in 23 statements. v2026.7.2 drops
+`OrganizationInviteLink.EncryptedOrgKey` and renames
+`OrganizationInviteLink.EncryptedInviteKey`.
+
+migcheck caught all three breaks in v2026.10.0, in 278 statements.
+v2026.10.0 renames `AccessRequest.Status`, `AccessRequest.ResolvedDate`, and
+`AccessLease.Status`. The report lists each one as a separate cause. Postgres
+reports only the first missing column in a statement, so a statement that
+uses both of `AccessRequest`'s renamed columns counts under the one Postgres
+reports, which is usually `ResolvedDate`.
+
+v2026.5.0 and v2026.6.2 add tables, indexes, and columns with defaults, so
+migcheck passed them. v2026.6.2 also makes `Send.Key` and `Send.Data` NOT
+NULL. v2026.5.0's tests never write a Send without them, so this isn't a
+break for the tests either.
+
+Bitwarden releases backport many migrations to patch releases. For example,
+v2026.2.1 already includes v2026.3.0's migration that drops
+`Send.EmailHashes`. These runs compare the latest patch of each release.
+
+This test found a gap in migcheck. Npgsql sends `DISCARD ALL` each time the
+app returns a connection to the pool. Those statements failed on both
+schemas and made up 34% to 46% of each run, so the report warned that
+migcheck hadn't checked them. migcheck now runs the parts of `DISCARD ALL`
+that work in a transaction, which reset the session. The results didn't
+change.
+
+In v2026.9.2's runs, one test failed with a serialization error. It fails
+about half the time without migcheck too. The tests ran in the .NET SDK image
+that each release's `global.json` names.
+
+## Cal.com
+
+migcheck replayed Cal.com's integration tests on Postgres for three upgrades.
+Each workload ran Cal.com's seed script, then the tests. v5.6.20 and v5.7.12
+run Prisma's Rust query engine. v5.8.14 runs Prisma's TypeScript client with
+the `@prisma/adapter-pg` driver adapter, which sends queries through node-pg.
+
+| Upgrade | Statements | Result |
+|---|---|---|
+| v5.6.20 to v5.7.12 | 9,381 | Pass |
+| v5.7.12 to v5.8.14 | 9,630 | Fail |
+| v5.8.14 to v5.9.15 | 10,246 | Pass |
+
+migcheck caught the break in v5.8.14, in 247 statements. v5.8.14 adds
+`users.uuid`, fills it, and makes it NOT NULL, all in one release. The
+database has no default for the column. Prisma's `@default(uuid())` generates
+the value in v5.8.14's client, and v5.7.12's client doesn't know the column.
+Every user that v5.7.12 creates breaks.
+
+migcheck missed a break in v5.7.12. v5.7.12 drops `Watchlist.severity` and
+other `Watchlist` columns, and v5.6.20's watchlist checks filter on
+`severity`. v5.6.20's integration tests and seed script never reach those
+checks, so the run had no queries to replay. This finding comes from reading
+the code, not from a run.
+
+v5.9.15's migrations add tables, change column types in the tables they
+add, and drop NOT NULL constraints, so migcheck passed it.
+
+All integration tests passed in each run. The commands ran in a Node 20
+image.
+
+## Outline
+
+migcheck replayed Outline's server tests on Postgres for three upgrades, with
+eight test workers.
+
+| Upgrade | Statements | Result |
+|---|---|---|
+| v1.7.1 to v1.8.0 | 40,773 | Fail |
+| v1.8.1 to v1.9.0 | 43,763 | Pass |
+| v1.11.0 to v1.12.0 | 61,748 | Pass |
+
+migcheck caught the one break in v1.8.0, in 24 statements. v1.8.0 replaces
+the unique index on `document_insights ("documentId", date)` with one that
+adds `period`. v1.7.1's insight rollup upserts with `ON CONFLICT
+("documentId", date)`, which needs the old index. The break changes no column
+or table.
+
+v1.9.0 drops `teams.collaborativeEditing`, which v1.8.1's model no longer
+declares, so migcheck passed it. v1.12.0 replaces the migrations up to v1.3.0
+with one baseline migration that does nothing on an existing database.
+migcheck passed it too.
+
+Outline's popularity task creates a working table, then fills and reads it.
+Replay drops DDL, so the task's other statements failed on both schemas. They
+were 36 to 54 statements per run, most of the statements that migcheck
+skipped.
+
+All server tests passed in each run.

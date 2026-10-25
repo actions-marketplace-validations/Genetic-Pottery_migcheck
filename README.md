@@ -27,21 +27,43 @@ For example, this is migcheck's output for the
 `v2-rename` renames a column that `v1` uses:
 
 ```
-FAIL: 4 statements from v1 break after v2-rename's migrations.
+FAIL: 4 statements from v1 break after v2-rename's migrations, from 1 cause:
+    users.name  4 statements
 
-  [42703] column "name" of relation "users" does not exist
-      2 statements in 1 transactions. Examples:
+  users.name
+      [42703] column "name" of relation "users" does not exist (2)
+      [42703] column "name" does not exist (2)
+      4 statements in 1 transactions. Examples:
       INSERT INTO users (name, email) VALUES ('Ada O''Brien', 'ada@example.com') RETURNING id
       UPDATE users SET name = 'Ada Lovelace' WHERE id = '1'
-
-  [42703] column "name" does not exist
-      2 statements in 1 transactions. Examples:
       SELECT id, name, email FROM users WHERE id = '1'
 
 v1 fails during a rolling deploy of v2-rename, and after a rollback to v1.
 ```
 
 migcheck supports Postgres and MySQL. It's an early release.
+
+## Tested with
+
+migcheck has caught breaking migrations in real upgrades of the following
+apps, using each app's own test suite. For the results, see
+[EVIDENCE.md](EVIDENCE.md). For setup steps by framework, see
+[RECIPES.md](RECIPES.md).
+
+| Framework | Language | Database | App |
+|---|---|---|---|
+| Django | Python | Postgres | Plane |
+| Active Record (Rails) | Ruby | Postgres | Mastodon |
+| xorm | Go | Postgres, MySQL | Gitea |
+| Hibernate | Java | Postgres, MySQL | Keycloak |
+| Knex | Node | MySQL | Ghost |
+| TypeORM | Node | Postgres | n8n |
+| Prisma | Node | Postgres | Cal.com |
+| Sequelize | Node | Postgres | Outline |
+| Diesel | Rust | Postgres | Lemmy |
+| Ecto | Elixir | Postgres | Akkoma |
+| Laravel | PHP | MySQL | BookStack |
+| Entity Framework | .NET | Postgres | Bitwarden |
 
 ## What it catches
 
@@ -60,9 +82,6 @@ from the database. The migration looks safe, but the old release's inserts fail.
 
 Run migcheck on the database you deploy to. The same query can pass on one
 database and fail on another.
-
-migcheck has been tested against real upgrades of Django, Rails, Go, Node, and
-Java apps. For the results, see [EVIDENCE.md](EVIDENCE.md).
 
 ## Install
 
@@ -111,8 +130,9 @@ migcheck --base v1.4.0 --head main \
   --workload "pytest"
 ```
 
-For Rails, SQLAlchemy, Go, Node, and apps that migrate on startup, and for
-apps that don't read `DATABASE_URL`, see [RECIPES.md](RECIPES.md).
+For Rails, SQLAlchemy, Go, Node, Prisma, Sequelize, Rust, Elixir, Laravel,
+Entity Framework, and apps that migrate on startup, and for apps that don't read
+`DATABASE_URL`, see [RECIPES.md](RECIPES.md).
 
 migcheck exits with one of the following codes:
 
@@ -277,6 +297,11 @@ transaction, as test runners do after each test, replay rolls back its effects
 too. The report lists the first failure in each transaction as a root cause and
 groups later integrity errors in that transaction separately.
 
+The report groups root causes by the table, column, or function that each
+error names. Databases word one missing column differently in reads and writes,
+and a read's error names the query's alias for the table, not the table. To
+find the table, migcheck looks up the alias in the statement.
+
 migcheck also accounts for how test runners use the database:
 
 - It records queries from every database the workload touches, because test
@@ -312,8 +337,10 @@ and migcheck removes the container and worktrees when it finishes.
   keys then fail on both schemas, and migcheck skips them.
 - migcheck supports MySQL 8.0 and later. It doesn't support MariaDB, whose
   query log has a different format.
-- Postgres words some errors differently for reads and writes, so one missing
-  column can appear as two root causes.
+- If migcheck can't tell which table a column error refers to, the error
+  stays a cause of its own. This happens when a statement reads from a
+  subquery or a function, or when an error names neither the table nor an
+  alias.
 
 ## Run the tests
 

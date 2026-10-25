@@ -12,7 +12,7 @@ import subprocess
 import time
 import uuid
 
-from .common import Statement
+from .common import MIGRATED_KEY, Statement, column_owner
 from .common import run as _run
 
 DEFAULT_IMAGE = "postgres:17-alpine"
@@ -43,6 +43,11 @@ TXN_CONTROL = re.compile(
 # Schema changes come from test runners building their database, not from the
 # app's runtime queries.
 DDL = re.compile(r"^\s*(CREATE|ALTER|DROP|COMMENT|GRANT|REVOKE)\b", re.IGNORECASE)
+# Connection pools, such as Npgsql's, send DISCARD ALL to reset a connection
+# that the app returns. It can't run in a transaction, so replay runs the
+# parts that undo the app's role and settings.
+DISCARD_ALL = re.compile(r"^\s*DISCARD\s+ALL\s*;?\s*$", re.IGNORECASE)
+SESSION_RESET = "SET SESSION AUTHORIZATION DEFAULT; RESET ALL"
 # Test runners empty tables between tests by name. On the new schema a listed
 # table can be gone, or a new table can reference one and block the TRUNCATE.
 # Either way the tables stay full and every later test collides with old rows,
@@ -51,7 +56,29 @@ TRUNCATE = re.compile(
     r"^\s*TRUNCATE\s+(?:TABLE\s+)?(.*?)(\s+(?:RESTART|CONTINUE|CASCADE|RESTRICT)\b.*)?;?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+# Errors that name the schema object a statement used, so the report can
+# group a dropped column's errors together however each statement named it.
+COLUMN_OF = re.compile(r'^(?:column|null value in column) "(.+?)" of relation "(.+?)" ')
+QUALIFIED_COLUMN = re.compile(r'^column ((?:"(?:[^"]|"")+"|[^".\s]+))\.(.+) does not exist$')
+COLUMN = re.compile(r'^column "(.+)" does not exist$')
+RELATION = re.compile(r'^relation "(?:.+\.)?(.+)" does not exist$')
+FUNCTION = re.compile(r'^function (?:[\w$]+\.)?([\w$]+)\(.*\) does not exist$')
 STATEMENT = re.compile(r"^(?:statement|execute [^:]+): (.*)$", re.DOTALL)
+# One token of a statement, for finding the placeholders outside quoted text
+# and comments. A quote inside a comment, such as "won't", doesn't start a
+# string. An unterminated string or comment runs to the end.
+SQL_TOKEN = re.compile(
+    r"""--[^\n]*"""
+    r"""|[Ee]'(?:\\.|''|[^'\\])*(?:'|\Z)"""
+    r"""|'(?:''|[^'])*(?:'|\Z)"""
+    r"""|"(?:""|[^"])*(?:"|\Z)"""
+    r"""|\$(?P<tag>(?:[^\W\d]\w*)?)\$.*?(?:\$(?P=tag)\$|\Z)"""
+    r"""|\$(?P<param>\d+)"""
+    # Keywords and identifiers, which can hold $ but don't start a string.
+    r"""|[^\W\d][\w$]*"""
+    r"""|\d+|[^-'"$/\w]+|.""",
+    re.DOTALL,
+)
 PARAM = re.compile(r"\$(\d+) = ('(?:[^']|'')*'|NULL)")
 ROW_ID = "migcheck-id "
 
@@ -84,6 +111,57 @@ CREATE EVENT TRIGGER _migcheck_attach ON ddl_command_end
 """
 
 PIN_IDS = """
+-- Whether a row that the head migrations wrote holds the key that row r takes
+-- in the unique index idx. Those rows have an xmin between the mark taken
+-- before the migrations and the start of replay.
+CREATE FUNCTION _migcheck.holds_migrated_key(rel regclass, idx text, r anyelement) RETURNS bool AS $f$
+DECLARE
+  cond text;
+  found bool;
+BEGIN
+  SELECT string_agg(format('%I = ($1).%I', a.attname, a.attname), ' AND '), bool_and(a.attname IS NOT NULL)
+    INTO cond, found
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY k(attnum, ord)
+    LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+   WHERE i.indrelid = rel AND c.relname = idx AND k.ord <= i.indnkeyatts;
+  -- An expression index has no column to compare.
+  IF cond IS NULL OR NOT found THEN
+    RETURN false;
+  END IF;
+  EXECUTE format('SELECT EXISTS (SELECT FROM %s WHERE %s AND xmin::text::bigint >= $2 AND xmin::text::bigint < $3)', rel, cond)
+    INTO found
+    USING r, current_setting('migcheck.migrated_after')::bigint, current_setting('migcheck.replay_start')::bigint;
+  RETURN found;
+END
+$f$ LANGUAGE plpgsql;
+
+-- Runs a statement that failed on the unique index idx again, and returns
+-- whether it collides there with a row the head migrations wrote: one written
+-- after the mark migrated_after and before replay_start. The run always rolls
+-- back.
+CREATE FUNCTION _migcheck.migrated_key(stmt text, row_ids text, idx text, migrated_after bigint, replay_start bigint) RETURNS bool AS $f$
+DECLARE
+  hint text := '';
+BEGIN
+  -- Set for this check only. Replayed statements can reset session settings.
+  PERFORM set_config('migcheck.migrated_after', migrated_after::text, true);
+  PERFORM set_config('migcheck.replay_start', replay_start::text, true);
+  PERFORM set_config('migcheck.ids', row_ids, true);
+  PERFORM set_config('migcheck.pos', '0', true);
+  PERFORM set_config('migcheck.probe', idx, true);
+  BEGIN
+    EXECUTE stmt;
+    RAISE EXCEPTION 'migcheck probe succeeded';
+  EXCEPTION WHEN OTHERS THEN
+    GET STACKED DIAGNOSTICS hint = PG_EXCEPTION_HINT;
+  END;
+  PERFORM set_config('migcheck.probe', '', true);
+  RETURN hint = 'migcheck-migrated-key';
+END
+$f$ LANGUAGE plpgsql;
+
 CREATE FUNCTION _migcheck.pin_id() RETURNS trigger AS $f$
 DECLARE
   ids jsonb := coalesce(nullif(current_setting('migcheck.ids', true), ''), '[]')::jsonb;
@@ -107,6 +185,10 @@ BEGIN
         END IF;
       END IF;
     END IF;
+  END IF;
+  IF coalesce(current_setting('migcheck.probe', true), '') <> ''
+     AND _migcheck.holds_migrated_key(TG_RELID, current_setting('migcheck.probe'), NEW) THEN
+    RAISE EXCEPTION 'migcheck probe' USING HINT = 'migcheck-migrated-key';
   END IF;
   RETURN NEW;
 END
@@ -198,9 +280,32 @@ class Postgres:
         # lines with a random key.
         return "\n".join(line for line in dump.splitlines() if line and not line.startswith(("--", "\\")))
 
+    def mark(self):
+        """Returns a point in the server's transaction history. Rows written
+        after it have a higher xmin."""
+        return int(self._psql("postgres", "COPY (SELECT txid_current() % 4294967296) TO STDOUT;"))
+
     def record(self):
         """Starts recording statements. Postgres logs every statement from
         the start, so this does nothing."""
+
+    @staticmethod
+    def cause(msg, sql):
+        """Returns the table, column, or function that an error says is
+        missing or changed, such as "users.name", or None."""
+        if m := COLUMN_OF.match(msg):
+            return f"{m.group(2)}.{m.group(1)}"
+        if m := QUALIFIED_COLUMN.match(msg):
+            table, column = column_owner(sql, m.group(1), fold=True), m.group(2).strip('"')
+            return table and f"{table}.{column}"
+        if m := COLUMN.match(msg):
+            table = column_owner(sql, None, fold=True)
+            return table and f"{table}.{m.group(1)}"
+        if m := RELATION.match(msg):
+            return m.group(1)
+        if m := FUNCTION.match(msg):
+            return f"{m.group(1)}()"
+        return None
 
     @staticmethod
     def is_integrity_error(state):
@@ -226,13 +331,17 @@ class Postgres:
             raise RuntimeError(f"reading the Postgres log failed with exit code {proc.returncode}")
         return statements
 
-    def replay(self, db, statements):
+    def replay(self, db, statements, migrated_after=None):
         """Runs each statement in order and returns a list of (sqlstate, message).
 
         A statement that succeeds keeps its effects until the end of its
         block, so later statements see the rows earlier ones wrote. A failing
         statement rolls back on its own and replay continues. Both entries are
         None on success.
+
+        With `migrated_after`, a mark taken before the head migrations ran, a
+        duplicate key error on a key that a migration's row holds gets
+        MIGRATED_KEY appended to its message.
         """
         tag = f"$mc_{uuid.uuid4().hex}$"
         lines = [
@@ -259,6 +368,8 @@ BEGIN
 END
 $f$ LANGUAGE plpgsql;""",
             PIN_IDS,
+            f"SET migcheck.migrated_after = '{migrated_after if migrated_after is not None else -1}';",
+            f"SET migcheck.migrated_key = '{MIGRATED_KEY}';",
         ]
         for i, s in enumerate(statements):
             ids = json.dumps(s.ids)
@@ -279,6 +390,14 @@ DECLARE
   ids int[] := '{}';
   states text[] := '{}';
   msgs text[] := '{}';
+  st text;
+  msg text;
+  idx text;
+  -- Read once, before any replayed statement can reset the session settings
+  -- or a rolled-back block can undo them.
+  migrated_after bigint := current_setting('migcheck.migrated_after')::bigint;
+  migrated_note text := current_setting('migcheck.migrated_key');
+  replay_start bigint := txid_current() % 4294967296;
 BEGIN
   FOR b IN SELECT block, bool_and(keep) AS keep FROM _migcheck.stmt GROUP BY block ORDER BY block LOOP
     -- Deferred constraints (Django's foreign keys, for example) would
@@ -294,9 +413,14 @@ BEGIN
         states := array_append(states, NULL::text);
         msgs := array_append(msgs, NULL::text);
       EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS st = RETURNED_SQLSTATE, msg = MESSAGE_TEXT, idx = CONSTRAINT_NAME;
+        IF st = '23505' AND migrated_after >= 0
+           AND _migcheck.migrated_key(s.sql, s.row_ids, idx, migrated_after, replay_start) THEN
+          msg := msg || migrated_note;
+        END IF;
         ids := array_append(ids, s.id);
-        states := array_append(states, SQLSTATE);
-        msgs := array_append(msgs, SQLERRM);
+        states := array_append(states, st);
+        msgs := array_append(msgs, msg);
       END;
     END LOOP;
     IF b.keep THEN
@@ -360,6 +484,8 @@ def parse_log(log, exclude):
         if row[COL_DETAIL].lower().startswith("parameters: "):
             params = {int(n): v for n, v in PARAM.findall(row[COL_DETAIL])}
             sql = _inline_params(sql, params)
+        if DISCARD_ALL.match(sql):
+            sql = SESSION_RESET
         if truncate := TRUNCATE.match(sql):
             sql = _lenient_truncate(truncate)
         last[session] = [sql, []]
@@ -388,29 +514,29 @@ def _lenient_truncate(match):
 
 
 def _inline_params(sql, params):
-    """Replaces $N placeholders with logged literals, skipping quoted text."""
+    """Replaces $N placeholders with logged literals, skipping quoted text and
+    comments."""
     out = []
     i = 0
     while i < len(sql):
-        c = sql[i]
-        if c in "'\"":
-            end = i + 1
-            while end < len(sql):
-                if sql[end] == c:
-                    if end + 1 < len(sql) and sql[end + 1] == c:
-                        end += 2
-                        continue
-                    break
-                end += 1
-            out.append(sql[i:end + 1])
-            i = end + 1
+        if sql.startswith("/*", i):
+            # Postgres nests block comments, which a regex can't match.
+            depth, end = 1, i + 2
+            while end < len(sql) and depth:
+                if sql.startswith("/*", end):
+                    depth, end = depth + 1, end + 2
+                elif sql.startswith("*/", end):
+                    depth, end = depth - 1, end + 2
+                else:
+                    end += 1
+            out.append(sql[i:end])
+            i = end
             continue
-        m = re.match(r"\$(\d+)", sql[i:])
-        if m and int(m.group(1)) in params:
-            out.append(params[int(m.group(1))])
-            i += len(m.group(0))
-            continue
-        out.append(c)
-        i += 1
+        m = SQL_TOKEN.match(sql, i)
+        if m.group("param") and int(m.group("param")) in params:
+            out.append(params[int(m.group("param"))])
+        else:
+            out.append(m.group(0))
+        i = m.end()
     return "".join(out)
 
