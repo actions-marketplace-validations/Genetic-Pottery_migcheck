@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.5.0 - 2026-10-26
+
+### Added
+
+- migcheck runs on Supabase's Postgres image, and on other images where
+  `postgres` isn't a superuser. migcheck keeps the image's server command and
+  config, runs its own SQL as the image's superuser, and starts its databases
+  from a copy of the `postgres` database that the image set up.
+- `RECIPES.md` shows how to set up migcheck for Supabase, with scripts in
+  `examples/supabase` that apply the Auth server's migrations and run the
+  tests through PostgREST and the Auth server.
+  `examples/make-supabase-demo.sh` builds a demo to try them on.
+- `EVIDENCE.md` includes the Supabase example, and says which Keycloak tests
+  the Keycloak runs leave out and why.
+- Replay applies the role and settings that PostgREST switches to in each
+  request, so a migration that changes a row-level security policy can break
+  replayed writes.
+
+### Fixed
+
+- Replay skipped every write that came through PostgREST, because the
+  request body lost its `json` type when migcheck inlined it.
+- Replay dropped statements from roles and databases that turn
+  `log_statement` or `log_min_messages` down, as Supabase's Auth and Storage
+  roles do.
+- Replay failed on `DEALLOCATE`, which drivers such as Go's pgx send for
+  prepared statements that replay never creates.
+- A replayed `SET ROLE` carried into the statements of later transactions,
+  including other sessions' and the schema probes, and broke replay when the
+  role couldn't read migcheck's own schema. Replay resets the role at the
+  start of each transaction.
+
+## v0.4.0 - 2026-10-25
+
+### Added
+
+- migcheck writes schema probes: queries generated from the schema change,
+  for the tables, columns, and functions that the head release's migrations
+  drop or rename, and for inserts that need a value they didn't need before.
+  Probes run on Postgres and MySQL. A probe that works on the old schema and fails on the
+  new one is reported in its own section, with the base release's files that
+  mention the name. Findings add a warning to a pass. To fail the run on
+  them, use `--fail-on-probes`, or the action's `fail-on-probes` input. To
+  turn probes off, use `--no-probes`.
+- `EVIDENCE.md` includes the schema probe results. On Plane, the probes
+  flagged all 5 breaking migrations that replay missed, including 2 that the
+  earlier results counted as safe.
+
 ## v0.3.0 - 2026-10-25
 
 ### Added

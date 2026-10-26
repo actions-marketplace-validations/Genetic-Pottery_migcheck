@@ -32,6 +32,11 @@ inputs:
       Whether a failing workload command is an error. By default, migcheck
       checks the queries the workload ran and adds a warning to a pass.
     default: "false"
+  fail-on-probes:
+    description: >-
+      Whether a failing schema probe fails the job. By default, schema probes
+      that fail add a warning to a pass.
+    default: "false"
   working-directory:
     description: Directory of the git repository to check.
     default: .
@@ -64,6 +69,7 @@ runs:
         INPUT_DB: ${{ inputs.db }}
         INPUT_IMAGE: ${{ inputs.image }}
         INPUT_REQUIRE_WORKLOAD_SUCCESS: ${{ inputs.require-workload-success }}
+        INPUT_FAIL_ON_PROBES: ${{ inputs.fail-on-probes }}
         COMMENT_KEY: ${{ inputs.comment-key }}
       run: |
         report="$RUNNER_TEMP/migcheck-$COMMENT_KEY.md"
@@ -81,6 +87,7 @@ runs:
               --migrate "$INPUT_MIGRATE" --workload "$INPUT_WORKLOAD" --markdown "$report")
         [ -n "$INPUT_IMAGE" ] && args+=(--image "$INPUT_IMAGE")
         [ "$INPUT_REQUIRE_WORKLOAD_SUCCESS" = true ] && args+=(--require-workload-success)
+        [ "$INPUT_FAIL_ON_PROBES" = true ] && args+=(--fail-on-probes)
         if [ "$INPUT_HEAD" = HEAD ] && [ -n "${GITHUB_BASE_REF:-}" ]; then
           args+=(--head-name "this pull request")
         fi

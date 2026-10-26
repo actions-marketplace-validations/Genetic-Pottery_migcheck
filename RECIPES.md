@@ -321,6 +321,57 @@ migcheck --base v1.0.0 --head main \
 
 Tested with Bitwarden server on Postgres.
 
+## Supabase
+
+Copy the scripts in [examples/supabase](examples/supabase) into your
+project, then run:
+
+```sh
+migcheck --base v1.0.0 --head main \
+  --image supabase/postgres:17.11.0.004 \
+  --migrate "npm ci && scripts/migcheck-migrate.sh" \
+  --workload "node scripts/migcheck-stack.mjs npm test"
+```
+
+- `migcheck-migrate.sh` applies the Auth server's migrations and then
+  `supabase/migrations`, as `supabase start` does. Without the Auth server's
+  migrations, `auth.uid()` reads an older JWT setting, and every RLS check
+  fails.
+- `migcheck-stack.mjs` starts PostgREST, the Auth server, and a gateway on
+  `DATABASE_URL`, then runs your tests with `SUPABASE_URL`,
+  `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` set. Your tests must
+  read these variables instead of pointing at `supabase start`.
+- Use the image versions your Supabase CLI runs, in `--image` and in both
+  scripts. To list them, run `supabase start` and then `docker ps`.
+- Run the queries you want checked through PostgREST, with `supabase-js`.
+  PostgREST switches to the signed-in user's role, and replay does the same,
+  so a migration that changes an RLS policy can break the replayed writes.
+  Queries that tests run directly as `postgres` skip RLS, because the role
+  bypasses it.
+- A policy change that only hides rows raises no error, so migcheck doesn't
+  catch it.
+- The scripts use `docker run --network host`, which needs Linux or a Docker
+  Desktop version with host networking turned on.
+
+The scripts don't start the Storage server, so a workload that uploads files
+doesn't run.
+
+To try the setup, build the Supabase demo. It's the todo list from Supabase's
+`nextjs-todo-list` example, with one base release and four candidate
+releases. It needs Node.js and npm.
+
+```sh
+examples/make-supabase-demo.sh /tmp/mc-supabase-demo
+cd /tmp/mc-supabase-demo
+migcheck --base v1 --head v2-rls \
+  --image supabase/postgres:17.11.0.004 \
+  --migrate "npm ci && scripts/migcheck-migrate.sh" \
+  --workload "node scripts/migcheck-stack.mjs npm test"
+```
+
+For each release's result, see the
+[Supabase example](EVIDENCE.md#supabase-example) in `EVIDENCE.md`.
+
 ## Apps that migrate on startup
 
 Some apps, such as Keycloak and many Spring Boot apps with Flyway or
@@ -367,6 +418,9 @@ problems itself:
   includes a note. That's expected for a release without migrations.
 - If 10% or more of the statements fail on the base schema too, the result
   includes a warning, because migcheck didn't check those statements.
+- If migcheck can't read the schemas to write schema probes, such as on a
+  Postgres version older than 12, the result
+  includes a note and checks only the recorded statements.
 
 Check the following yourself before trusting a result:
 
@@ -389,6 +443,12 @@ Check the following yourself before trusting a result:
 - **The migrations that ran.** If the result reports breaks from migrations
   you meant to skip, log the migrate command's output and check which
   migrations it applied.
+- **The schema probe findings.** A probe shows what might break, not what
+  does. For each finding, open the files the report lists and check whether
+  the base release still uses the name. If no file mentions it, the change is
+  probably a safe drop of a column the base release stopped using. If the
+  report lists changes that migcheck couldn't probe, those tables weren't
+  checked beyond the recorded statements.
 
 ## Other stacks
 

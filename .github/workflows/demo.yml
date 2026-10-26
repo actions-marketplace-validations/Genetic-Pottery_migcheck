@@ -22,6 +22,13 @@ jobs:
             expect: fail
           - head: v2-notnull
             expect: fail
+          # Only a schema probe catches this one, so it passes with a
+          # warning unless fail-on-probes is set.
+          - head: v2-untested
+            expect: pass
+          - head: v2-untested
+            fail-on-probes: "true"
+            expect: fail
     steps:
       - uses: actions/checkout@v5
       - name: Build the demo repository
@@ -41,6 +48,7 @@ jobs:
           migrate: ${{ runner.temp }}/venv/bin/python migrate.py
           workload: ${{ runner.temp }}/venv/bin/python test_app.py
           comment: "false"
+          fail-on-probes: ${{ matrix.fail-on-probes || 'false' }}
       - name: Check the verdict
         env:
           RESULT: ${{ steps.migcheck.outputs.result }}

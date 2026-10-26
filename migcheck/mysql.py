@@ -6,6 +6,7 @@ container, so the host needs only Docker.
 """
 
 import bisect
+import json
 import re
 from collections import Counter
 import subprocess
@@ -53,6 +54,112 @@ UNKNOWN_COLUMN = re.compile(r"^Unknown column '(?:(.+)\.)?([^.']+)' in ")
 NO_DEFAULT = re.compile(r"^(?:Field '(.+)' doesn't have a default value|Column '(.+)' cannot be null)$")
 NO_TABLE = re.compile(r"^Table '(?:[^.']+\.)?(.+)' doesn't exist$")
 NO_FUNCTION = re.compile(r"^FUNCTION (?:[^.\s]+\.)?(\S+) does not exist$")
+
+# The schema as JSON, for generating schema probes. MySQL names a schema per
+# database, and the base and head databases have different names, so names
+# leave it out.
+CATALOG = """
+SELECT JSON_OBJECT(
+  'relations', (SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+      'name', t.TABLE_NAME, 'kind', IF(t.TABLE_TYPE = 'VIEW', 'v', 'r'),
+      'columns', (SELECT JSON_ARRAYAGG(JSON_OBJECT(
+          'name', c.COLUMN_NAME, 'type', c.COLUMN_TYPE, 'notnull', c.IS_NULLABLE = 'NO',
+          'default', c.COLUMN_DEFAULT IS NOT NULL, 'generated', c.EXTRA LIKE '%GENERATED%',
+          'identity', c.EXTRA LIKE '%auto_increment%', 'position', c.ORDINAL_POSITION))
+        FROM information_schema.COLUMNS c
+        WHERE c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME))), JSON_ARRAY())
+    FROM information_schema.TABLES t WHERE t.TABLE_SCHEMA = DATABASE()),
+  'fks', (SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+      'table', k.TABLE_NAME, 'ref', k.REFERENCED_TABLE_NAME, 'name', k.CONSTRAINT_NAME,
+      'column', k.COLUMN_NAME, 'ref_column', k.REFERENCED_COLUMN_NAME, 'position', k.ORDINAL_POSITION)), JSON_ARRAY())
+    FROM information_schema.KEY_COLUMN_USAGE k
+    WHERE k.TABLE_SCHEMA = DATABASE() AND k.REFERENCED_TABLE_NAME IS NOT NULL
+      AND k.REFERENCED_TABLE_SCHEMA = DATABASE()),
+  'functions', (SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+      'name', r.ROUTINE_NAME,
+      'args', (SELECT COALESCE(JSON_ARRAYAGG(p.DTD_IDENTIFIER), JSON_ARRAY()) FROM information_schema.PARAMETERS p
+               WHERE p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA AND p.SPECIFIC_NAME = r.SPECIFIC_NAME
+                 AND p.ORDINAL_POSITION > 0))), JSON_ARRAY())
+    FROM information_schema.ROUTINES r WHERE r.ROUTINE_SCHEMA = DATABASE() AND r.ROUTINE_TYPE = 'FUNCTION')
+)
+"""
+# Values for the columns an insert probe must set, by type name. Probes run
+# after replay, so text and integers are random, to miss the unique values
+# that replayed rows hold.
+LITERALS = {
+    "tinyint": "FLOOR(1 + RAND() * 100)", "smallint": "FLOOR(1 + RAND() * 32000)",
+    "mediumint": "FLOOR(1 + RAND() * 8000000)", "int": "FLOOR(1 + RAND() * 2000000000)",
+    "integer": "FLOOR(1 + RAND() * 2000000000)", "bigint": "FLOOR(1 + RAND() * 2000000000)",
+    "decimal": "0", "numeric": "0", "float": "0", "double": "0", "real": "0", "bit": "b'0'",
+    "date": "NOW()", "datetime": "NOW()", "timestamp": "NOW()", "time": "NOW()", "year": "2000",
+    "tinytext": "MD5(RAND())", "text": "MD5(RAND())", "mediumtext": "MD5(RAND())", "longtext": "MD5(RAND())",
+    "tinyblob": "''", "blob": "''", "mediumblob": "''", "longblob": "''", "json": "JSON_OBJECT()", "set": "''",
+}
+SIZED = re.compile(r"^(char|varchar|binary|varbinary)\((\d+)\)")
+ENUM = re.compile(r"^enum\('((?:[^']|'')*)'", re.IGNORECASE)
+
+
+class Dialect:
+    """Writes probe SQL for MySQL."""
+
+    @staticmethod
+    def reads_back(column):
+        """Whether an insert can read back a value the database filled in
+        `column`. MySQL has no RETURNING, so only LAST_INSERT_ID() reads an
+        auto-increment key back."""
+        return column["identity"]
+
+    @staticmethod
+    def ident(name):
+        return "`" + name.replace("`", "``") + "`"
+
+    @classmethod
+    def table(cls, schema, name):
+        return cls.ident(name)
+
+    @staticmethod
+    def null(type_name):
+        return "NULL"
+
+    @staticmethod
+    def literal(type_name, catalog):
+        t = type_name.lower()
+        if m := ENUM.match(type_name):
+            return f"'{m.group(1)}'"
+        if m := SIZED.match(t):
+            if m.group(1) in ("binary", "varbinary"):
+                return f"LEFT(UNHEX(MD5(RAND())), {m.group(2)})"
+            return f"LEFT(MD5(RAND()), {m.group(2)})"
+        return LITERALS.get(re.split(r"[\s(]", t)[0])
+
+    @classmethod
+    def insert(cls, rows):
+        """Returns the rows as statements, parents first. A column that a
+        later row uses goes through a user variable, set before the insert
+        from its value or after it from LAST_INSERT_ID()."""
+        def var(j, col):
+            return f"@mc{j}_{rows[j].returning.index(col)}"
+
+        out = []
+        for i, row in enumerate(rows):
+            exprs = []
+            for col, value in row.values.items():
+                if value[0] == "ref":
+                    exprs.append(var(value[1], value[2]))
+                    if col in row.returning:
+                        out.append(f"SET {var(i, col)} = {var(value[1], value[2])}")
+                elif col in row.returning:
+                    out.append(f"SET {var(i, col)} = {value[1]}")
+                    exprs.append(var(i, col))
+                else:
+                    exprs.append(value[1])
+            cols = ", ".join(cls.ident(c) for c in row.values)
+            out.append(f"INSERT INTO {cls.ident(row.table)} ({cols}) VALUES ({', '.join(exprs)})")
+            for col in row.returning:
+                if col not in row.values:
+                    out.append(f"SET {var(i, col)} = LAST_INSERT_ID()")
+        return out
+
 
 INTEGRITY_ERRORS = {"1022", "1048", "1062", "1169", "1216", "1217", "1364", "1451", "1452", "1557", "1586", "3819"}
 FOREIGN_KEY_ERRORS = {"1216", "1217", "1451", "1452"}
@@ -146,6 +253,34 @@ class MySQL:
         """Starts recording statements. The log stays off until the workload
         runs, so setup statements don't appear in it."""
         _run(self._client("-e", "SET GLOBAL general_log = ON"))
+
+    dialect = Dialect
+
+    def catalog(self, db):
+        """Returns the database's tables, columns, foreign keys, and functions,
+        for generating schema probes."""
+        raw = json.loads(_run(self._client("-N", "-B", "--raw", db, "-e", CATALOG)))
+        fks = {}
+        for k in sorted(raw["fks"], key=lambda k: (k["table"], k["name"], k["position"])):
+            group = fks.setdefault(f".{k['table']}", {}).setdefault(
+                k["name"], {"table": f".{k['table']}", "ref": f".{k['ref']}", "columns": [], "ref_columns": []})
+            group["columns"].append(k["column"])
+            group["ref_columns"].append(k["ref_column"])
+        return {
+            "relations": {
+                f".{r['name']}": {
+                    "schema": "", "name": r["name"], "kind": r["kind"],
+                    "columns": {c["name"]: {**c, "notnull": bool(c["notnull"]), "default": bool(c["default"]),
+                                            "generated": bool(c["generated"]), "identity": bool(c["identity"])}
+                                for c in sorted(r["columns"], key=lambda c: c["position"])},
+                }
+                for r in raw["relations"]
+            },
+            "fks": {t: list(groups.values()) for t, groups in fks.items()},
+            "functions": {f".{f['name']}({', '.join(f['args'])})": {**f, "schema": ""} for f in raw["functions"]},
+            "enums": {},
+            "domains": {},
+        }
 
     @staticmethod
     def cause(msg, sql):

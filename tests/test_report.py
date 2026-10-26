@@ -5,18 +5,26 @@ import tempfile
 import unittest
 
 from migcheck import __main__ as cli
+from migcheck import probes
 from migcheck.common import MIGRATED_KEY, Statement
 from migcheck.postgres import Postgres
 
 OK = (None, None)
 
 
-def run_report(statements, old, new, workload_exit=0, head_name=None, schema_changed=True):
+def run_report(statements, old, new, workload_exit=0, head_name=None, schema_changed=True,
+               found=(), unchecked=(), fail_on_probes=False, probe_error=None):
     """Runs report() and returns (exit code, stdout)."""
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        code = cli.report(Postgres, "v1", "v2", statements, old, new, workload_exit, head_name, schema_changed)
+        code = cli.report(Postgres, "v1", "v2", statements, old, new, workload_exit, head_name, schema_changed,
+                          found, unchecked, fail_on_probes, probe_error)
     return code, out.getvalue()
+
+
+def finding(name="Watchlist.severity", files=("src/watchlist.ts",), mentions=1):
+    probe = probes.Probe(name, "column dropped", ['SELECT "severity" FROM "public"."Watchlist" LIMIT 0'])
+    return probes.Finding(probe, "42703", 'column "severity" does not exist', list(files), mentions)
 
 
 class ClassifyTest(unittest.TestCase):
@@ -234,3 +242,81 @@ class ExamplesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProbeReportTest(unittest.TestCase):
+    def setUp(self):
+        cli.MARKDOWN = None
+
+    def tearDown(self):
+        cli.MARKDOWN = None
+
+    def test_probe_findings_warn(self):
+        code, out = run_report([Statement("SELECT 1", 0, True)], [OK], [OK], found=[finding()])
+        self.assertEqual(code, 0)
+        self.assertIn("PASS WITH WARNING: all 1 statements from v1 still work after v2's migrations, "
+                      "but 1 schema probe fails on v2's schema.", out)
+        self.assertIn("Schema probes: 1 change in v2's schema might break v1.", out)
+        self.assertIn("    Watchlist.severity  column dropped\n", out)
+        self.assertIn('      [42703] column "severity" does not exist\n', out)
+        self.assertIn("      v1 mentions severity and Watchlist in 1 file: src/watchlist.ts.\n", out)
+        self.assertIn("use --fail-on-probes", out)
+
+    def test_fail_on_probes(self):
+        code, out = run_report([Statement("SELECT 1", 0, True)], [OK], [OK], workload_exit=2,
+                               found=[finding()], fail_on_probes=True)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL: all 1 statements from v1 still work after v2's migrations, but the workload "
+                      "exited with code 2 and 1 schema probe fails on v2's schema.", out)
+        self.assertNotIn("use --fail-on-probes", out)
+
+    def test_names_without_mentions(self):
+        _, out = run_report([Statement("SELECT 1", 0, True)], [OK], [OK], found=[finding(files=(), mentions=0)])
+        self.assertIn("No file in v1 mentions severity and Watchlist outside its migrations.", out)
+
+    def test_many_mentions(self):
+        _, out = run_report([Statement("SELECT 1", 0, True)], [OK], [OK],
+                            found=[finding(files=("a", "b", "c"), mentions=7)])
+        self.assertIn("v1 mentions severity and Watchlist in 7 files: a, b, c, and 4 more.", out)
+
+    def test_unchecked_probes(self):
+        code, out = run_report([Statement("SELECT 1", 0, True)], [OK], [OK],
+                               unchecked=[("nodes.x", "its required foreign keys form a cycle")])
+        self.assertEqual(code, 0)
+        self.assertIn("PASS: all 1 statements", out)
+        self.assertIn("migcheck couldn't probe 1 change:\n    nodes.x: its required foreign keys form a cycle", out)
+
+    def test_markdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cli.MARKDOWN = os.path.join(tmp, "result.md")
+            run_report([Statement("SELECT 1", 0, True)], [OK], [OK], found=[finding()])
+            with open(cli.MARKDOWN) as f:
+                md = f.read()
+        self.assertIn("### migcheck: PASS with a warning", md)
+        self.assertIn("#### Schema probes: 1 change might break `v1`", md)
+        self.assertIn("| `Watchlist.severity` | column dropped | 1 |", md)
+        self.assertIn("`v1` mentions `severity` and `Watchlist` in 1 file: `src/watchlist.ts`.", md)
+
+    def test_probe_errors_dont_stop_the_run(self):
+        class OldServer:
+            dialect = None
+
+            def catalog(self, db):
+                raise RuntimeError('psql... failed:\nERROR:  column a.attgenerated does not exist\nLINE 6: ...\n   ^')
+
+        self.assertEqual(cli._generate_probes(OldServer()),
+                         ([], [], "RuntimeError: ERROR:  column a.attgenerated does not exist"))
+        code, out = run_report([Statement("SELECT 1", 0, True)], [OK], [OK],
+                               probe_error="RuntimeError: ERROR:  column a.attgenerated does not exist")
+        self.assertEqual(code, 0)
+        self.assertIn("PASS: all 1 statements", out)
+        self.assertIn("Note: migcheck couldn't generate schema probes, so only the recorded statements were "
+                      "checked. RuntimeError: ERROR:  column a.attgenerated does not exist", out)
+
+    def test_lists_other_columns_the_table_needs(self):
+        f = finding(name="users.plan")
+        f.probe = probes.Probe("users.plan", "new column requires a value", ["INSERT"], ("users", "plan"))
+        f.others = [("bio", "column no longer accepts NULL")]
+        _, out = run_report([Statement("SELECT 1", 0, True)], [OK], [OK], found=[f])
+        self.assertIn("      The table has more columns that now need a value: bio (column no longer accepts NULL).\n", out)
+        self.assertIn("v1 mentions plan and users in 1 file", out)

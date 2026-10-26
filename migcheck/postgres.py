@@ -43,6 +43,10 @@ TXN_CONTROL = re.compile(
 # Schema changes come from test runners building their database, not from the
 # app's runtime queries.
 DDL = re.compile(r"^\s*(CREATE|ALTER|DROP|COMMENT|GRANT|REVOKE)\b", re.IGNORECASE)
+# Replay inlines statements that drivers prepare over the protocol, so it
+# never creates the ones they free, as Go's pgx does. A statement prepared
+# with PREPARE replays, so its DEALLOCATE does too.
+DEALLOCATE = re.compile(r'^\s*DEALLOCATE\s+(?:PREPARE\s+)?"?([^";\s]+)"?\s*;?\s*$', re.IGNORECASE)
 # Connection pools, such as Npgsql's, send DISCARD ALL to reset a connection
 # that the app returns. It can't run in a transaction, so replay runs the
 # parts that undo the app's role and settings.
@@ -63,7 +67,7 @@ QUALIFIED_COLUMN = re.compile(r'^column ((?:"(?:[^"]|"")+"|[^".\s]+))\.(.+) does
 COLUMN = re.compile(r'^column "(.+)" does not exist$')
 RELATION = re.compile(r'^relation "(?:.+\.)?(.+)" does not exist$')
 FUNCTION = re.compile(r'^function (?:[\w$]+\.)?([\w$]+)\(.*\) does not exist$')
-STATEMENT = re.compile(r"^(?:statement|execute [^:]+): (.*)$", re.DOTALL)
+STATEMENT = re.compile(r"^(?:statement|execute ([^:]+)): (.*)$", re.DOTALL)
 # One token of a statement, for finding the placeholders outside quoted text
 # and comments. A quote inside a comment, such as "won't", doesn't start a
 # string. An unterminated string or comment runs to the end.
@@ -80,6 +84,10 @@ SQL_TOKEN = re.compile(
     re.DOTALL,
 )
 PARAM = re.compile(r"\$(\d+) = ('(?:[^']|'')*'|NULL)")
+# PostgREST, which Supabase apps write through, binds a write's request body
+# as a json parameter in this subquery. The log doesn't record the type, and
+# an inlined literal in a select list is text, which json_to_record() rejects.
+POSTGREST_BODY = re.compile(r"\(SELECT (\$\d+) AS json_data\) pgrst_payload\b")
 ROW_ID = "migcheck-id "
 
 # Many apps let the database generate primary keys, through a sequence or a
@@ -162,6 +170,9 @@ BEGIN
 END
 $f$ LANGUAGE plpgsql;
 
+-- Runs as its owner, because a replayed statement can switch to a role that
+-- row-level security limits, as PostgREST's do, and the checks must see
+-- every row.
 CREATE FUNCTION _migcheck.pin_id() RETURNS trigger AS $f$
 DECLARE
   ids jsonb := coalesce(nullif(current_setting('migcheck.ids', true), ''), '[]')::jsonb;
@@ -192,7 +203,7 @@ BEGIN
   END IF;
   RETURN NEW;
 END
-$f$ LANGUAGE plpgsql;
+$f$ LANGUAGE plpgsql SECURITY DEFINER;
 
 DO $f$
 DECLARE r record;
@@ -207,6 +218,176 @@ $f$;
 """
 
 
+# The base and head schemas as JSON, for generating schema probes. It leaves
+# out the catalogs, objects that extensions own, partitions, which their
+# parent table covers, and migcheck's own objects.
+APP_SCHEMAS = "n.nspname NOT IN ('pg_catalog', 'information_schema', '_migcheck') AND n.nspname NOT LIKE 'pg\\_toast%'"
+CATALOG = f"""
+COPY (SELECT json_build_object(
+  'relations', (SELECT coalesce(json_agg(json_build_object(
+      'schema', n.nspname, 'name', c.relname, 'kind', c.relkind,
+      'columns', (SELECT coalesce(json_agg(json_build_object(
+          'name', a.attname, 'type', format_type(a.atttypid, a.atttypmod), 'notnull', a.attnotnull,
+          'default', a.atthasdef, 'generated', a.attgenerated <> '', 'identity', a.attidentity <> '')
+          ORDER BY a.attnum), '[]')
+        FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped))), '[]')
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT c.relispartition AND {APP_SCHEMAS}
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')),
+  'fks', (SELECT coalesce(json_agg(json_build_object(
+      'table', n.nspname || '.' || c.relname, 'ref', rn.nspname || '.' || rc.relname,
+      'columns', (SELECT json_agg(a.attname ORDER BY k.i) FROM unnest(con.conkey) WITH ORDINALITY k(num, i)
+                  JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.num),
+      'ref_columns', (SELECT json_agg(a.attname ORDER BY k.i) FROM unnest(con.confkey) WITH ORDINALITY k(num, i)
+                      JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.num))), '[]')
+    FROM pg_constraint con
+    JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_class rc ON rc.oid = con.confrelid JOIN pg_namespace rn ON rn.oid = rc.relnamespace
+    -- A foreign key to a partitioned table also has a row per partition.
+    WHERE con.contype = 'f' AND con.conparentid = 0 AND {APP_SCHEMAS}),
+  'functions', (SELECT coalesce(json_agg(json_build_object(
+      'schema', n.nspname, 'name', p.proname,
+      'args', (SELECT coalesce(json_agg(format_type(t, NULL) ORDER BY i), '[]')
+               FROM unnest(p.proargtypes::oid[]) WITH ORDINALITY u(t, i)))), '[]')
+    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.prokind = 'f' AND {APP_SCHEMAS} AND p.proname NOT LIKE '\\_migcheck%'
+      AND p.prorettype NOT IN ('trigger'::regtype, 'event_trigger'::regtype)
+      AND NOT EXISTS (SELECT 1 FROM pg_depend d
+                      WHERE d.classid = 'pg_proc'::regclass AND d.objid = p.oid AND d.deptype = 'e')),
+  'enums', (SELECT coalesce(json_object_agg(format_type(t.oid, NULL),
+      (SELECT e.enumlabel FROM pg_enum e WHERE e.enumtypid = t.oid ORDER BY e.enumsortorder LIMIT 1)), '{{}}')
+    FROM pg_type t WHERE t.typtype = 'e'),
+  'domains', (SELECT coalesce(json_object_agg(format_type(t.oid, NULL), format_type(t.typbasetype, t.typtypmod)), '{{}}')
+    FROM pg_type t WHERE t.typtype = 'd')
+)::text) TO STDOUT WITH CSV;
+"""
+# Values for the columns an insert probe must set, by type name. Probes run
+# after replay, so text and integers are random, to miss the unique values
+# that replayed rows hold. Types with a length or precision take a value that
+# fits any length.
+LITERALS = {
+    "smallint": "(1 + random() * 32000)::int", "integer": "(1 + random() * 2e9)::int",
+    "bigint": "(1 + random() * 2e9)::bigint", "numeric": "0", "real": "0", "double precision": "0",
+    "money": "0", "oid": "0", "boolean": "false", "uuid": "md5(random()::text)::uuid", "json": "'{}'",
+    "jsonb": "'{}'", "bytea": "''", "interval": "'1 day'", "inet": "'127.0.0.1'", "cidr": "'127.0.0.1'",
+    "macaddr": "'08:00:2b:01:02:03'", "tsvector": "''", "xml": "'<migcheck/>'", "point": "'(0,0)'",
+    "date": "now()", "timestamp without time zone": "now()", "timestamp with time zone": "now()",
+    "time without time zone": "now()", "time with time zone": "now()",
+    # gen_random_uuid() is built in only from Postgres 13, and probes run on 12.
+    "text": "md5(random()::text)", "citext": "md5(random()::text)", "name": "md5(random()::text)",
+}
+# Text with a length limit takes that many characters of a random value.
+LIMITED_TEXT = re.compile(r"^(character varying|character)\((\d+)\)$")
+
+
+class Dialect:
+    """Writes probe SQL for Postgres."""
+
+    @staticmethod
+    def reads_back(column):
+        """Whether an insert can read back a value the database filled in
+        `column`. RETURNING reads back any column."""
+        return True
+
+    @staticmethod
+    def ident(name):
+        return '"' + name.replace('"', '""') + '"'
+
+    @classmethod
+    def table(cls, schema, name):
+        return f"{cls.ident(schema)}.{cls.ident(name)}"
+
+    @staticmethod
+    def null(type_name):
+        return f"NULL::{type_name}"
+
+    @classmethod
+    def insert(cls, rows):
+        """Returns the rows as one statement: each parent row in a CTE that
+        returns the columns its children use, then the last row."""
+        ctes, select = [], ""
+        for i, row in enumerate(rows):
+            exprs, sources = [], []
+            for value in row.values.values():
+                if value[0] == "literal":
+                    exprs.append(value[1])
+                else:
+                    exprs.append(f"p{value[1]}.{cls.ident(value[2])}")
+                    if f"p{value[1]}" not in sources:
+                        sources.append(f"p{value[1]}")
+            q = cls.table(row.schema, row.table)
+            cols = ", ".join(cls.ident(c) for c in row.values)
+            ret = f" RETURNING {', '.join(cls.ident(c) for c in row.returning)}" if row.returning else ""
+            if not row.values:
+                select = f"INSERT INTO {q} DEFAULT VALUES{ret}"
+            elif sources:
+                select = f"INSERT INTO {q} ({cols}) SELECT {', '.join(exprs)} FROM {', '.join(sources)}{ret}"
+            else:
+                select = f"INSERT INTO {q} ({cols}) VALUES ({', '.join(exprs)}){ret}"
+            if i < len(rows) - 1:
+                ctes.append(f"p{i} AS ({select})")
+        return [f"WITH {', '.join(ctes)} {select}" if ctes else select]
+
+    @classmethod
+    def literal(cls, type_name, catalog):
+        if type_name.endswith("[]"):
+            return f"'{{}}'::{type_name}"
+        if type_name in catalog["enums"]:
+            label = catalog["enums"][type_name].replace("'", "''")
+            return f"'{label}'::{type_name}"
+        if type_name in catalog["domains"]:
+            base = cls.literal(catalog["domains"][type_name], catalog)
+            return base and f"{base}::{type_name}"
+        if m := LIMITED_TEXT.match(type_name):
+            return f"left(md5(random()::text), {m.group(2)})::{type_name}"
+        if type_name in ("character varying", "character"):
+            return f"md5(random()::text)::{type_name}"
+        value = LITERALS.get(re.sub(r"\(.*?\)", "", type_name).strip())
+        return value and f"({value})::{type_name}"
+
+
+# Removes the logging settings that roles and databases override, which
+# would leave their statements out of the log.
+LOG_EVERY_ROLE = """
+DO $$
+DECLARE
+  s record;
+  name text;
+BEGIN
+  FOR s IN SELECT setrole::regrole AS role, d.datname, setconfig FROM pg_db_role_setting
+           LEFT JOIN pg_database d ON d.oid = setdatabase LOOP
+    FOREACH name IN ARRAY ARRAY['log_statement', 'log_min_messages'] LOOP
+      CONTINUE WHEN NOT EXISTS (SELECT FROM unnest(s.setconfig) c WHERE c LIKE name || '=%');
+      IF s.role::oid = 0 THEN
+        EXECUTE format('ALTER DATABASE %I RESET %I', s.datname, name);
+      ELSIF s.datname IS NULL THEN
+        EXECUTE format('ALTER ROLE %s RESET %I', s.role, name);
+      ELSE
+        EXECUTE format('ALTER ROLE %s IN DATABASE %I RESET %I', s.role, s.datname, name);
+      END IF;
+    END LOOP;
+  END LOOP;
+END
+$$;
+"""
+# The copy of the postgres database that migcheck's databases start from, on
+# images that set it up for the app.
+BASE_DB = "mc_base"
+
+
+def _server_command(image):
+    """Returns the image's own server command, such as Supabase's `postgres -D
+    /etc/postgresql`, so that migcheck's settings add to the image's config
+    instead of replacing it. Returns [] for an image whose command isn't the
+    server, and the entrypoint then starts it."""
+    inspect = ["docker", "image", "inspect", image, "--format", "{{json .Config.Cmd}}"]
+    if subprocess.run(inspect, capture_output=True).returncode != 0:
+        _run(["docker", "pull", "-q", image])
+    cmd = json.loads(_run(inspect)) or []
+    return cmd if cmd[:1] == ["postgres"] else []
+
+
 class Postgres:
     name = "Postgres"
     default_image = DEFAULT_IMAGE
@@ -215,6 +396,10 @@ class Postgres:
         self.image = image
         self.container = None
         self.port = None
+        # The role migcheck runs its own SQL as, which must be a superuser.
+        self.admin = "postgres"
+        # The database that migcheck's databases start from.
+        self.base = "template1"
 
     def start(self):
         self.container = f"migcheck-{uuid.uuid4().hex[:8]}"
@@ -223,6 +408,7 @@ class Postgres:
             "-e", f"POSTGRES_PASSWORD={PASSWORD}",
             "-p", "127.0.0.1::5432",
             self.image,
+            *_server_command(self.image),
             "-c", "log_statement=all",
             "-c", "logging_collector=on",
             "-c", "log_destination=csvlog",
@@ -247,10 +433,48 @@ class Postgres:
                 capture_output=True,
             )
             if check.returncode == 0:
-                self._psql("template1", CAPTURE_IDS)
+                self._set_up()
                 return
             time.sleep(0.5)
         raise RuntimeError("Postgres did not become ready in 30 seconds")
+
+    def _set_up(self):
+        # Some images, such as Supabase's, make postgres a regular role and
+        # create a separate superuser.
+        self.admin = self._psql("postgres", "COPY (SELECT rolname FROM pg_roles WHERE rolsuper AND rolcanlogin "
+                                            "ORDER BY rolname <> 'postgres', rolname LIMIT 1) TO STDOUT;").strip()
+        if not self.admin:
+            raise RuntimeError(f"{self.image} has no superuser that can log in")
+        self._psql("template1", CAPTURE_IDS)
+        # An image that makes postgres a regular role sets up the database
+        # the app gets, as Supabase's does with its auth schema and
+        # extensions. Migrations depend on that setup, so migcheck's
+        # databases start from a copy. Other images, such as postgis's, set
+        # up the postgres database too, but for their own use.
+        if self.admin != "postgres":
+            self._copy_postgres(BASE_DB)
+            self._psql(BASE_DB, CAPTURE_IDS)
+            self.base = BASE_DB
+
+    def _copy_postgres(self, name):
+        # Background workers, such as pg_cron's and pg_net's, connect to the
+        # postgres database, and Postgres copies only a database with no
+        # other sessions. The workers reconnect after the copy.
+        self._psql("template1", "ALTER DATABASE postgres ALLOW_CONNECTIONS false;")
+        try:
+            for _ in range(20):
+                self._psql("template1", "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                                        "WHERE datname = 'postgres' AND pid <> pg_backend_pid();")
+                try:
+                    self._psql("template1", f'CREATE DATABASE "{name}" TEMPLATE postgres;')
+                    return
+                except RuntimeError as e:
+                    if "is being accessed by other users" not in str(e):
+                        raise
+                time.sleep(0.5)
+            raise RuntimeError("background sessions kept reconnecting to the postgres database, so migcheck couldn't copy it")
+        finally:
+            self._psql("template1", "ALTER DATABASE postgres ALLOW_CONNECTIONS true;")
 
     def stop(self):
         if self.container:
@@ -261,24 +485,47 @@ class Postgres:
         return f"postgresql://postgres:{PASSWORD}@127.0.0.1:{self.port}/{db}"
 
     def create_db(self, name, template=None):
-        sql = f'CREATE DATABASE "{name}"'
-        if template:
-            sql += f' TEMPLATE "{template}"'
+        sql = f'CREATE DATABASE "{name}" TEMPLATE "{template or self.base}"'
+        # The app connects as postgres, so it must own the databases that
+        # a separate superuser creates.
+        if self.admin != "postgres":
+            sql += " OWNER postgres"
         self._psql("postgres", sql)
 
     def has_tables(self, db):
-        out = self._psql(db, "COPY (SELECT count(*) FROM pg_tables "
-                             "WHERE schemaname NOT IN ('pg_catalog', 'information_schema')) TO STDOUT;")
-        return int(out) > 0
+        """Whether the database has tables that its base database doesn't."""
+        names = "COPY (SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema')) TO STDOUT;"
+        return bool(set(self._psql(db, names).splitlines()) - set(self._psql(self.base, names).splitlines()))
 
     def schema(self, db):
         """Returns the database's schema as text, for comparing two databases."""
         assert self.container
-        dump = _run(["docker", "exec", self.container, "pg_dump", "-U", "postgres",
+        dump = _run(["docker", "exec", self.container, "pg_dump", "-U", self.admin,
                      "--schema-only", "--no-owner", "--no-privileges", db])
         # Comments name the database, and pg_dump 17.6 and later add \restrict
         # lines with a random key.
         return "\n".join(line for line in dump.splitlines() if line and not line.startswith(("--", "\\")))
+
+    dialect = Dialect
+
+    def catalog(self, db):
+        """Returns the database's tables, columns, foreign keys, and functions,
+        for generating schema probes."""
+        row = next(csv.reader(io.StringIO(self._psql(db, CATALOG))))
+        raw = json.loads(row[0])
+        fks = {}
+        for fk in raw["fks"]:
+            fks.setdefault(fk["table"], []).append(fk)
+        return {
+            "relations": {
+                f"{r['schema']}.{r['name']}": {**r, "columns": {c["name"]: c for c in r["columns"]}}
+                for r in raw["relations"]
+            },
+            "fks": fks,
+            "functions": {f"{f['schema']}.{f['name']}({', '.join(f['args'])})": f for f in raw["functions"]},
+            "enums": raw["enums"],
+            "domains": raw["domains"],
+        }
 
     def mark(self):
         """Returns a point in the server's transaction history. Rows written
@@ -287,7 +534,11 @@ class Postgres:
 
     def record(self):
         """Starts recording statements. Postgres logs every statement from
-        the start, so this does nothing."""
+        the start, except for roles and databases that turn logging down.
+        Supabase's image does that for the roles its Auth and Storage servers
+        log in as, so their writes, such as new users, would be missing from
+        replay. Migrations can turn it down too, so this runs after them."""
+        self._psql("postgres", LOG_EVERY_ROLE)
 
     @staticmethod
     def cause(msg, sql):
@@ -383,6 +634,9 @@ $f$ LANGUAGE plpgsql;""",
         # later read of it. Results collect in variables because a rolled-back
         # block also rolls back any rows it wrote.
         lines.append("""
+-- Replayed statements can switch roles, and a statement that fails on a
+-- unique key calls migrated_key() under its role.
+GRANT USAGE ON SCHEMA _migcheck TO PUBLIC;
 CREATE PROCEDURE _migcheck.replay() AS $do$
 DECLARE
   b record;
@@ -404,6 +658,10 @@ BEGIN
     -- otherwise fail the whole block at commit instead of failing the
     -- statement that broke them.
     SET CONSTRAINTS ALL IMMEDIATE;
+    -- Blocks from different sessions run one after another here, so a role
+    -- that one session set for itself mustn't reach the next block.
+    SET SESSION AUTHORIZATION DEFAULT;
+    RESET ROLE;
     FOR s IN SELECT id, row_ids, sql FROM _migcheck.stmt WHERE block = b.block ORDER BY id LOOP
       BEGIN
         PERFORM set_config('migcheck.ids', s.row_ids, true);
@@ -429,6 +687,8 @@ BEGIN
       ROLLBACK;
     END IF;
   END LOOP;
+  SET SESSION AUTHORIZATION DEFAULT;
+  RESET ROLE;
   INSERT INTO _migcheck.result SELECT * FROM unnest(ids, states, msgs);
 END
 $do$ LANGUAGE plpgsql;
@@ -446,7 +706,7 @@ COPY (SELECT id, sqlstate, message FROM _migcheck.result ORDER BY id) TO STDOUT 
     def _psql(self, db, sql):
         return _run(
             ["docker", "exec", "-i", self.container,
-             "psql", "-U", "postgres", "-d", db, "-X", "-q", "-v", "ON_ERROR_STOP=1"],
+             "psql", "-U", self.admin, "-d", db, "-X", "-q", "-v", "ON_ERROR_STOP=1"],
             stdin=sql,
         )
 
@@ -455,10 +715,11 @@ def parse_log(log, exclude):
     """Returns the statements in a csvlog, read from the text stream `log`,
     logged against any database not in `exclude`, with bind parameters
     inlined."""
-    exclude = {"postgres", "template0", "template1", *exclude}
+    exclude = {"postgres", "template0", "template1", BASE_DB, *exclude}
     blocks = []  # [keep, [[sql, ids], ...]] in the order transactions started
     open_blocks = {}  # session ID -> its open block
     last = {}  # session ID -> its last replayed [sql, ids], or None
+    prepared = {}  # session ID -> names of statements prepared over the protocol
     for row in csv.reader(log):
         if row[COL_DATABASE] in exclude or row[COL_SEVERITY] != "LOG":
             continue
@@ -470,8 +731,10 @@ def parse_log(log, exclude):
         match = STATEMENT.match(row[COL_MESSAGE])
         if not match:
             continue
-        sql = match.group(1).strip()
+        sql = match.group(2).strip()
         last[session] = None
+        if match.group(1):
+            prepared.setdefault(session, set()).add(match.group(1))
         if TXN_BEGIN.match(sql):
             open_blocks[session] = [True, []]
             blocks.append(open_blocks[session])
@@ -481,9 +744,11 @@ def parse_log(log, exclude):
                 block[0] = bool(TXN_COMMIT.match(sql))
         if not sql or TXN_CONTROL.match(sql) or DDL.match(sql):
             continue
+        if (freed := DEALLOCATE.match(sql)) and freed.group(1) in prepared.get(session, ()):
+            continue
         if row[COL_DETAIL].lower().startswith("parameters: "):
             params = {int(n): v for n, v in PARAM.findall(row[COL_DETAIL])}
-            sql = _inline_params(sql, params)
+            sql = _inline_params(POSTGREST_BODY.sub(r"(SELECT \1::json AS json_data) pgrst_payload", sql), params)
         if DISCARD_ALL.match(sql):
             sql = SESSION_RESET
         if truncate := TRUNCATE.match(sql):

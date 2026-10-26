@@ -4,6 +4,7 @@ These tests start a Postgres and a MySQL container, so they take a minute.
 They're skipped when Docker isn't available.
 """
 
+import subprocess
 import unittest
 
 from migcheck.common import MIGRATED_KEY, Statement
@@ -13,6 +14,15 @@ from migcheck.postgres import Postgres
 from .helpers import have_docker, mysql_stdin
 
 OK = (None, None)
+# A role that row-level security limits to its own notes.
+ROLE_SETUP = """
+DO $$ BEGIN CREATE ROLE replay_user; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE TABLE notes (id serial PRIMARY KEY, owner text NOT NULL);
+ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
+CREATE POLICY own ON notes USING (owner = current_user) WITH CHECK (owner = current_user);
+GRANT ALL ON notes, users TO replay_user;
+GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO replay_user;
+"""
 
 
 @unittest.skipUnless(have_docker(), "needs Docker")
@@ -139,6 +149,43 @@ class PostgresReplayTest(unittest.TestCase):
         ], setup="DO $$ BEGIN CREATE ROLE replay_tenant; EXCEPTION WHEN duplicate_object THEN NULL; END $$;")
         self.assertEqual(results, [OK, OK, OK])
 
+    def test_switched_roles_get_row_level_security(self):
+        # PostgREST switches to the signed-in user's role in each request's
+        # transaction, and the role ends with it.
+        results = self.replay([
+            Statement("SELECT set_config('role', 'replay_user', true)", 0, True),
+            Statement("INSERT INTO notes (owner) VALUES ('someone else')", 0, True),
+            Statement("INSERT INTO notes (owner) VALUES ('someone else')", 1, True),
+        ], setup=ROLE_SETUP)
+        self.assertEqual(results[0], OK)
+        self.assertEqual(results[1], ("42501", 'new row violates row-level security policy for table "notes"'))
+        self.assertEqual(results[2], OK)
+
+    def test_labels_keys_that_a_migration_inserted_under_a_switched_role(self):
+        results = self.replay([
+            Statement("SELECT set_config('role', 'replay_user', true)", 0, True),
+            Statement("INSERT INTO users (email) VALUES ('seeded')", 0, True),
+        ], setup=ROLE_SETUP, migration="INSERT INTO users (email) VALUES ('seeded');")
+        self.assertTrue(results[1][1].endswith(MIGRATED_KEY))
+
+    def test_pins_ids_that_row_level_security_hides(self):
+        # The row with id 1 is hidden from the role, so pinning must check
+        # for it as the superuser.
+        results = self.replay([
+            Statement("SELECT set_config('role', 'replay_user', true)", 0, True),
+            Statement("INSERT INTO notes (owner) VALUES (current_user)", 0, True, [["notes", 1]]),
+        ], setup=ROLE_SETUP + "INSERT INTO notes (owner) VALUES ('someone else');")
+        self.assertEqual(results, [OK, OK])
+
+    def test_a_role_set_for_the_session_ends_with_its_block(self):
+        # Blocks from different sessions replay in turn, so the next block
+        # runs as the superuser, which row-level security doesn't limit.
+        results = self.replay([
+            Statement("SET ROLE replay_user", 0, True),
+            Statement("INSERT INTO notes (owner) VALUES ('someone else')", 1, True),
+        ], setup=ROLE_SETUP)
+        self.assertEqual(results, [OK, OK])
+
     def test_checking_a_key_leaves_no_rows(self):
         # The second row collides. Checking it runs the insert again, and the
         # first row of that run must not stay.
@@ -176,6 +223,74 @@ class PostgresReplayTest(unittest.TestCase):
 
     def test_statements_containing_dollar_quotes(self):
         results = self.replay([Statement("SELECT $$it's$$, $x$ $mc_ $x$", 0, True)])
+        self.assertEqual(results, [OK])
+
+
+# An image like Supabase's: postgres isn't a superuser, the init script sets
+# up the postgres database and turns logging off for a role, and the image's
+# command configures the server.
+SET_UP_IMAGE = "migcheck-test-set-up-image"
+SET_UP_DOCKERFILE = """
+FROM postgres:17-alpine
+ENV POSTGRES_USER=mc_admin POSTGRES_DB=postgres
+RUN printf '%s\\n' \\
+  "CREATE ROLE postgres LOGIN PASSWORD 'migcheck';" \\
+  "CREATE SCHEMA auth AUTHORIZATION postgres;" \\
+  "CREATE TABLE auth.users (id int PRIMARY KEY);" \\
+  "ALTER TABLE auth.users OWNER TO postgres;" \\
+  "CREATE ROLE auth_server LOGIN;" \\
+  "ALTER ROLE auth_server SET log_statement = none;" \\
+  "ALTER ROLE auth_server IN DATABASE postgres SET log_statement = none;" \\
+  "ALTER DATABASE postgres SET log_statement = none;" \\
+  "ALTER ROLE auth_server SET log_min_messages = fatal;" \\
+  > /docker-entrypoint-initdb.d/set-up.sql
+CMD ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
+"""
+
+
+@unittest.skipUnless(have_docker(), "needs Docker")
+class SetUpImageTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        subprocess.run(["docker", "build", "-q", "-t", SET_UP_IMAGE, "-"],
+                       input=SET_UP_DOCKERFILE, text=True, capture_output=True, check=True)
+        cls.db = Postgres(SET_UP_IMAGE)
+        try:
+            cls.db.start()
+        except Exception:
+            cls.db.stop()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.stop()
+        subprocess.run(["docker", "rmi", "-f", SET_UP_IMAGE], capture_output=True)
+
+    def test_keeps_the_images_server_command(self):
+        setting = self.db._psql("postgres", "COPY (SELECT current_setting('shared_preload_libraries')) TO STDOUT;")
+        self.assertEqual(setting.strip(), "pg_stat_statements")
+
+    def test_logs_every_role(self):
+        self.db.record()
+        settings = self.db._psql("postgres", "COPY (SELECT count(*) FROM pg_db_role_setting, unnest(setconfig) c "
+                                             "WHERE c LIKE 'log%') TO STDOUT;")
+        self.assertEqual(settings.strip(), "0")
+
+    def test_runs_as_the_images_superuser(self):
+        self.assertEqual(self.db.admin, "mc_admin")
+
+    def test_databases_start_from_the_postgres_database(self):
+        self.db.create_db("app")
+        owner = self.db._psql("app", "COPY (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = 'app') TO STDOUT;")
+        self.assertEqual(owner.strip(), "postgres")
+        self.assertFalse(self.db.has_tables("app"))
+        self.db._psql("app", "SET ROLE postgres; CREATE TABLE todos (id serial PRIMARY KEY, user_id int REFERENCES auth.users);")
+        self.assertTrue(self.db.has_tables("app"))
+
+    def test_replays(self):
+        self.db.create_db("replayed")
+        self.db._psql("replayed", "INSERT INTO auth.users VALUES (1);")
+        results = self.db.replay("replayed", [Statement("SELECT id FROM auth.users", 0, True)])
         self.assertEqual(results, [OK])
 
 

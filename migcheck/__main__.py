@@ -16,6 +16,7 @@ import tempfile
 import time
 from collections import Counter, defaultdict
 
+from . import probes
 from .common import MIGRATED_KEY
 from .mysql import MySQL
 from .postgres import Postgres
@@ -43,6 +44,11 @@ def main():
         "--require-workload-success", action="store_true",
         help="exit with code 2 if the workload command fails, instead of checking the queries it ran",
     )
+    parser.add_argument(
+        "--fail-on-probes", action="store_true",
+        help="exit with code 1 when a schema probe fails, even if every recorded statement still works",
+    )
+    parser.add_argument("--no-probes", action="store_true", help="don't generate schema probes")
     args = parser.parse_args()
     global MARKDOWN
     MARKDOWN = args.markdown
@@ -87,10 +93,25 @@ def main():
         migrated_after = db.mark()
         _sh(args.migrate, head_dir, db.url("mc_new"))
         schema_changed = db.schema("mc_old") != db.schema("mc_new")
+        probe_list, unchecked, probe_error = [], [], None
+        if schema_changed and not args.no_probes:
+            probe_list, unchecked, probe_error = _generate_probes(db)
 
-        step(f"Replaying {len(statements)} statements against both schemas")
-        old = db.replay("mc_old", statements)
-        new = db.replay("mc_new", statements, migrated_after)
+        step(f"Replaying {len(statements)} statements and {len(probe_list)} schema probes against both schemas")
+        # Probes run last, in blocks that roll back, so they don't change
+        # what the recorded statements see.
+        replayed = statements + probes.as_statements(probe_list, max(s.block for s in statements) + 1)
+        old = db.replay("mc_old", replayed)
+        new = db.replay("mc_new", replayed, migrated_after)
+        old, old_probes = old[:len(statements)], old[len(statements):]
+        new, new_probes = new[:len(statements)], new[len(statements):]
+        roots, knock_on, groups = classify(db, statements, old, new)
+        found, failed_on_old = probes.findings(
+            probe_list, old_probes, new_probes, {cause for cause, _ in groups if cause}, db.cause
+        )
+        unchecked += failed_on_old
+        if found:
+            probes.search(base_dir, found)
     except Exception as e:  # Exit code 1 means a query breaks, so nothing else may use it.
         fail(f"{type(e).__name__}: {e}")
     finally:
@@ -100,10 +121,29 @@ def main():
                 _git(repo, "worktree", "remove", "--force", d)
         shutil.rmtree(workdir, ignore_errors=True)
 
-    sys.exit(report(db, args.base, args.head, statements, old, new, workload_exit, args.head_name, schema_changed))
+    sys.exit(report(
+        db, args.base, args.head, statements, old, new, workload_exit, args.head_name, schema_changed,
+        found, unchecked, args.fail_on_probes, probe_error, (roots, knock_on, groups),
+    ))
 
 
-def report(db, base, head, statements, old, new, workload_exit, head_name=None, schema_changed=True):
+def _generate_probes(db):
+    """Returns (probes, unchecked, error) for the change from mc_old to
+    mc_new. If reading the schemas fails, for example on a database version
+    whose catalog lacks a column the query reads, the run goes on without
+    probes, and the error explains why."""
+    try:
+        return (*probes.generate(db.catalog("mc_old"), db.catalog("mc_new"), db.dialect), None)
+    except Exception as e:
+        # psql and mysql print the error, then the failing SQL, so the first
+        # error line says the most.
+        lines = [line.strip() for line in str(e).splitlines() if line.strip()]
+        error = next((line for line in lines if "ERROR" in line), lines[-1] if lines else "")
+        return [], [], f"{type(e).__name__}: {error}"
+
+
+def report(db, base, head, statements, old, new, workload_exit, head_name=None, schema_changed=True,
+           found=(), unchecked=(), fail_on_probes=False, probe_error=None, classified=None):
     """Prints the result, writes it as Markdown if requested, and returns the exit code."""
     head_md = head_name or f"`{head}`"
     head = head_name or head
@@ -113,8 +153,7 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
             f"all {skipped} statements fail on {base}'s own schema, so there is nothing to compare. "
             f"First error: [{old[0][0]}] {old[0][1]}"
         )
-    roots, knock_on = _classify(db, statements, old, new)
-    groups = _group(db, roots)
+    roots, knock_on, groups = classified or classify(db, statements, old, new)
     count = sum(len(v) for v in roots.values())
     causes = f"{len(groups)} cause{'s' if len(groups) != 1 else ''}"
     checked = len(statements) - skipped
@@ -136,6 +175,9 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
             "outside the recorded queries. The most common errors are listed above."
         )
         notes.append(("Warning", text, text.replace(f"{base}'s", f"`{base}`'s")))
+    if probe_error:
+        text = f"migcheck couldn't generate schema probes, so only the recorded statements were checked. {probe_error}"
+        notes.append(("Note", text, text))
     # A migrate command that silently applies nothing passes every query.
     if not schema_changed:
         text = "{}'s migrations didn't change the schema. If {} adds migrations, check that --migrate applies them to $DATABASE_URL."
@@ -147,9 +189,15 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
         for state, msg, n in _skip_reasons(old):
             print(f"    [{state}] {msg[:160]} ({n})")
         print()
-    if not roots and workload_exit:
-        print(f"PASS WITH WARNING: all {checked} statements from {base} still work after {head}'s migrations, "
-              f"but the workload exited with code {workload_exit}.")
+    reasons = []
+    if workload_exit:
+        reasons.append(f"the workload exited with code {workload_exit}")
+    if found:
+        reasons.append(f"{_plural(len(found), 'schema probe')} {'fails' if len(found) == 1 else 'fail'} on {head}'s schema")
+    probes_fail = bool(found) and fail_on_probes
+    if not roots and reasons:
+        print(f"{'FAIL' if probes_fail else 'PASS WITH WARNING'}: all {checked} statements from {base} still work "
+              f"after {head}'s migrations, but {' and '.join(reasons)}.")
     elif not roots:
         print(f"PASS: all {checked} statements from {base} still work after {head}'s migrations.")
     else:
@@ -179,13 +227,17 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
                 print(f"      [{state}] {msg} ({n})")
             print()
         print(f"{base} fails during a rolling deploy of {head}, and after a rollback to {base}.")
+    if found or unchecked:
+        print()
+        _print_probes(base, head, found, unchecked, fail_on_probes)
     for level, text, _ in notes:
         print(f"\n{level}: {text}")
 
     if MARKDOWN:
         md = [MARKER]
         if not roots:
-            md.append("### migcheck: PASS with a warning" if workload_exit else "### migcheck: PASS")
+            md.append("### migcheck: FAIL" if probes_fail else "### migcheck: PASS with a warning" if reasons
+                      else "### migcheck: PASS")
             md.append("")
             md.append(f"All {checked:,} statements from `{base}` still work after {head_md}'s migrations.")
         else:
@@ -229,6 +281,8 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
                     md.append(f"- `{state}` {_md_escape(msg)} ({n:,})")
                 md.append("")
                 md.append("</details>")
+        if found or unchecked:
+            md.extend(_markdown_probes(base, head_md, found, unchecked, fail_on_probes))
         if skipped:
             md.append("")
             md.append(f"<details><summary>Skipped {skipped:,} statements that also fail on <code>{base}</code>'s schema</summary>")
@@ -243,7 +297,93 @@ def report(db, base, head, statements, old, new, workload_exit, head_name=None, 
             md.append("")
             md.append(f"> [!{level.upper()}]\n> {text}")
         _write_markdown(md)
-    return 1 if roots else 0
+    return 1 if roots or probes_fail else 0
+
+
+def _plural(n, word):
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+def _mention(base, finding, quote="", files=None):
+    table, word = finding.probe.subject or probes.subject(finding.probe.name)
+    word = f"{quote}{word}{quote}"
+    also = f" and {quote}{table}{quote}" if table else ""
+    if not finding.mentions:
+        return f"No file in {base} mentions {word}{also} outside its migrations."
+    shown = files or finding.files
+    more = f", and {finding.mentions - len(shown)} more" if finding.mentions > len(shown) else ""
+    return f"{base} mentions {word}{also} in {_plural(finding.mentions, 'file')}: {', '.join(shown)}{more}."
+
+
+def _others(finding):
+    listed = ", ".join(f"{column} ({kind})" for column, kind in finding.others)
+    return f"The table has more columns that now need a value: {listed}."
+
+
+PROBES_INTRO = (
+    "migcheck wrote these queries from the schema change, not from the workload, so {base} might not run them. "
+    "A dropped column that {base} no longer uses is safe."
+)
+
+
+def _print_probes(base, head, found, unchecked, fail_on_probes):
+    if found:
+        print(f"Schema probes: {_plural(len(found), 'change')} in {head}'s schema might break {base}. "
+              + PROBES_INTRO.format(base=base))
+        if not fail_on_probes:
+            print("To fail the run on schema probes, use --fail-on-probes.")
+        width = min(40, max(len(f.probe.name) for f in found))
+        for f in found:
+            print(f"    {f.probe.name:<{width}}  {f.probe.kind}")
+        print()
+        for f in found:
+            print(f"  {f.probe.name}")
+            print(f"      [{f.state}] {f.msg}")
+            print(f"      {(f.sql or f.probe.sql)[:300]}")
+            if f.others:
+                print(f"      {_others(f)}")
+            print(f"      {_mention(base, f)}")
+            print()
+    if unchecked:
+        print(f"migcheck couldn't probe {_plural(len(unchecked), 'change')}:")
+        for name, reason in unchecked[:10]:
+            print(f"    {name}: {reason[:200]}")
+        if len(unchecked) > 10:
+            print(f"    and {len(unchecked) - 10} more")
+
+
+def _markdown_probes(base, head_md, found, unchecked, fail_on_probes):
+    md = [""]
+    if found:
+        md.append(f"#### Schema probes: {_plural(len(found), 'change')} might break `{base}`")
+        md.append("")
+        md.append(PROBES_INTRO.format(base=f"`{base}`") + (
+            "" if fail_on_probes else " To fail the run on schema probes, use `--fail-on-probes`."))
+        md.append("")
+        md.append("| Change | What changed | Mentions outside migrations |")
+        md.append("|---|---|---|")
+        for f in found:
+            md.append(f"| `{f.probe.name}` | {f.probe.kind} | {f.mentions:,} |")
+        for f in found:
+            md.append("")
+            md.append(f"**`{f.probe.name}`**: `{f.state}` {_md_escape(f.msg)}")
+            md.append("")
+            md.append("```sql")
+            md.append((f.sql or f.probe.sql)[:1000])
+            md.append("```")
+            if f.others:
+                md.append(_md_escape(_others(f)))
+                md.append("")
+            md.append(_mention(f"`{base}`", f, "`", [f"`{p}`" for p in f.files]))
+    if unchecked:
+        md.append("")
+        md.append(f"<details><summary>migcheck couldn't probe {_plural(len(unchecked), 'change')}</summary>")
+        md.append("")
+        for name, reason in unchecked:
+            md.append(f"- `{name}`: {_md_escape(reason[:300])}")
+        md.append("")
+        md.append("</details>")
+    return md
 
 
 def _classify(db, statements, old, new):
@@ -269,6 +409,12 @@ def _classify(db, statements, old, new):
         broken_blocks.add(s.block)
         roots[key].append(s)
     return roots, knock_on
+
+
+def classify(db, statements, old, new):
+    """Returns (roots, knock_on, groups) for the replay results."""
+    roots, knock_on = _classify(db, statements, old, new)
+    return roots, knock_on, _group(db, roots)
 
 
 def _group(db, roots):

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Builds a demo git repo with one base release and three candidate releases:
-#   v1          users table with a name column
+# Builds a demo git repo with one base release and four candidate releases:
+#   v1          users table with name and nickname columns
 #   v2-rename   renames name to full_name (breaks v1)
 #   v2-notnull  adds a NOT NULL column without a default (breaks v1 inserts)
 #   v2-expand   adds full_name next to name (safe)
+#   v2-untested drops nickname, which only untested code uses (a schema
+#               probe catches it, replay doesn't)
 #
 # Usage: make-demo.sh DIR
 set -euo pipefail
@@ -34,7 +36,8 @@ cat > migrations/001_create_users.sql <<'EOF'
 CREATE TABLE users (
   id    serial PRIMARY KEY,
   name  text NOT NULL,
-  email text NOT NULL UNIQUE
+  email text NOT NULL UNIQUE,
+  nickname text
 );
 EOF
 
@@ -54,10 +57,14 @@ def get_user(c, user_id):
 
 def rename_user(c, user_id, name):
     c.execute("UPDATE users SET name = %s WHERE id = %s", (name, user_id))
+
+def set_nickname(c, user_id, nickname):
+    c.execute("UPDATE users SET nickname = %s WHERE id = %s", (nickname, user_id))
 EOF
 
 cat > test_app.py <<'EOF'
-"""Stands in for the app's test suite: exercises every query the app makes."""
+"""Stands in for the app's test suite. Like many test suites, it misses a
+query: nothing here calls set_nickname."""
 import app
 
 with app.conn() as c:
@@ -90,5 +97,11 @@ UPDATE users SET full_name = name;
 EOF
 git add -A && git commit -q -m "v2: add full_name alongside name" && git tag v2-expand
 
+git checkout -q -b untested v1
+cat > migrations/002_drop_nickname.sql <<'EOF'
+ALTER TABLE users DROP COLUMN nickname;
+EOF
+git add -A && git commit -q -m "v2: drop nickname" && git tag v2-untested
+
 git checkout -q main
-echo "Demo repo ready at $dir (tags: v1, v2-rename, v2-notnull, v2-expand)"
+echo "Demo repo ready at $dir (tags: v1, v2-rename, v2-notnull, v2-expand, v2-untested)"

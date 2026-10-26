@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "migcheck"
-version = "0.3.0"
+version = "0.5.0"
 description = "Checks that a release's database migrations don't break the release running in production."
 readme = "README.md"
 license = "Apache-2.0"

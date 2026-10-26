@@ -119,6 +119,28 @@ class ParseLogTest(unittest.TestCase):
         ), exclude=set())
         self.assertEqual([s.sql for s in statements], ["SELECT '1', NULL"])
 
+    def test_casts_postgrest_request_bodies_to_json(self):
+        # PostgREST binds the body as json. Inlined, it would be text.
+        statements = parse_log(log(
+            ("app", "a",
+             'execute 7: INSERT INTO "todos"("task") SELECT "pgrst_body"."task" FROM (SELECT $1 AS json_data) pgrst_payload, '
+             'LATERAL (SELECT "task" FROM json_to_record(pgrst_payload.json_data) AS _("task" text)) pgrst_body',
+             """Parameters: $1 = '{"task":"Write it"}'"""),
+        ), exclude=set())
+        self.assertIn("""(SELECT '{"task":"Write it"}'::json AS json_data)""", statements[0].sql)
+
+    def test_drops_deallocate_for_statements_prepared_over_the_protocol(self):
+        statements = parse_log(log(
+            ("app", "a", "execute pgx_0: SELECT 1"),
+            ("app", "a", 'statement: deallocate "pgx_0"'),
+            ("app", "a", "statement: PREPARE q AS SELECT 2"),
+            ("app", "a", "statement: DEALLOCATE q"),
+            ("app", "b", 'statement: deallocate "pgx_0"'),
+        ), exclude=set())
+        self.assertEqual([s.sql for s in statements], [
+            "SELECT 1", "PREPARE q AS SELECT 2", "DEALLOCATE q", 'deallocate "pgx_0"',
+        ])
+
     def test_drops_transaction_control_and_ddl(self):
         statements = parse_log(log(
             ("app", "a", "statement: start transaction"),

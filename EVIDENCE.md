@@ -1,16 +1,22 @@
 # Test results
 
 These results come from running migcheck against real upgrades of open-source
-apps. Each run used the app's own test suite as the workload. The Postgres
-results and the BookStack results reflect migcheck 0.3.0. The MySQL results
-for Ghost, Gitea, and Keycloak reflect migcheck 0.2.0, because migcheck's
-MySQL replay hasn't changed since then. Rerunning the older Postgres results
-with 0.3.0 gave the same verdicts. When a release changes how migcheck
-records or replays queries, the affected results are rerun.
+apps. Each run used the app's own test suite as the workload.
+
+migcheck 0.5.0 reran every Postgres upgrade on this page: Plane's 25
+migrations and 23 upgrades of the other apps. Each run gave the same verdict
+and the same causes as before. Statement counts differed by up to 2% from the
+earlier runs, because test suites don't run exactly the same queries each
+time. The statement counts in the tables come from the earlier runs.
+
+The MySQL results for Ghost, Gitea, and Keycloak come from migcheck 0.2.0, and
+the BookStack results come from 0.3.0. migcheck's MySQL replay hasn't changed
+since then. When a release changes how migcheck records or replays queries,
+the affected results are rerun.
 
 | App | ORM | Database | Upgrades | Result |
 |---|---|---|---|---|
-| Plane | Django | Postgres | 25 migrations | Caught 6 of 9 breaks |
+| Plane | Django | Postgres | 25 migrations | Caught 6 of 11 breaks; schema probes flagged the other 5 |
 | Gitea | xorm (Go) | Postgres, MySQL | 2 | Caught the 1 break |
 | Ghost | Knex (Node) | MySQL | 2 | Caught all 3 breaks |
 | Keycloak | Hibernate (Java) | Postgres, MySQL | 2 | Caught all 3 breaks |
@@ -20,17 +26,48 @@ records or replays queries, the affected results are rerun.
 | Akkoma | Ecto (Elixir) | Postgres | 2 | Caught all 4 breaks |
 | BookStack | Laravel (PHP) | MySQL | 4 | Caught all 4 breaks |
 | Bitwarden | Entity Framework (.NET) | Postgres | 4 | Caught all 5 breaks |
-| Cal.com | Prisma (Node) | Postgres | 3 | Caught 1 of 2 breaks |
+| Cal.com | Prisma (Node) | Postgres | 3 | Caught 1 of 2 breaks; schema probes flagged the other |
 | Outline | Sequelize (Node) | Postgres | 3 | Caught the 1 break |
+
+migcheck also ran on Supabase's todo-list example, which isn't in this table.
+The example isn't a production app, and its breaking releases were written
+for the test. For details, see [Supabase example](#supabase-example).
 
 The n8n run raised the only false alarm left after the fix described in the
 Mastodon section. For details, see the n8n section.
 
+The schema probes reflect migcheck 0.4.0. Their results come from the Plane
+runs and from the upgrades listed in [Schema probes](#schema-probes).
+
 ## Plane
 
-migcheck checked 25 migrations from Plane's history. It caught 6 of the 9
-breaking migrations. It missed the other 3 because Plane's tests never queried
-the changed tables.
+migcheck checked 25 migrations from Plane's history, `0098` through `0122`.
+Replay caught 6 of the 11 breaking migrations. It missed the other 5 because
+Plane's tests never queried the changed tables. The schema probes flagged all
+5:
+
+| Migration | Change the probes found |
+|---|---|
+| `0098` | `profiles.is_app_rail_docked` requires a value |
+| `0100` | `profiles.has_marketing_email_consent` requires a value |
+| `0102` | `pages.sort_order` requires a value |
+| `0110` | `workspace_user_properties.navigation_control_preference` requires a value |
+| `0118` | `workspace_user_properties.product_tour` is dropped, and `profiles.product_tour` requires a value |
+
+Each of these migrations adds a field with a Python default. Django fills the
+existing rows and then drops the default from the database, so the old
+release's inserts, which don't set the new column, fail. An earlier version of
+these results counted only 9 breaking migrations, because it counted `0102`
+and `0110` as safe. The probes showed that they aren't.
+
+The probes also found more breaks in three migrations that replay had caught.
+`0104` makes `rich_filters` required in four more tables. `0113` makes
+`webhooks.version`, `workspace_user_properties.product_tour`, and two
+`profiles` columns required: `is_navigation_tour_completed` and
+`is_subscribed_to_changelog`. `0117` drops `pages.description` and
+`draft_issues.description`. The probes
+flagged nothing in the other 14 migrations. `0099` couldn't run, because
+Plane has two `0098` migrations at that commit.
 
 ## Gitea
 
@@ -56,6 +93,18 @@ one-worker runs.
 migcheck replayed Keycloak's test suite for two upgrades, 26.6.0 to 26.7.0 and
 26.7.0 to 26.8.0, on both Postgres and MySQL. The four runs replayed about 14
 million statements in total. The largest run replayed 4.8 million.
+
+The workload ran the tests in Keycloak's `tests/base` module, except for two
+kinds:
+
+- `WelcomePageTest` deletes the admin account that the test framework signs
+  in with. Keycloak's default test database starts empty each time the test
+  server starts, but migcheck's database keeps its data. With this test
+  included, every later test failed to sign in.
+- The classes in `org.keycloak.tests.suites` rerun tests from other classes.
+
+The Maven test pattern was
+`org.keycloak.tests.**,!org.keycloak.tests.suites.**,!**/WelcomePageTest`.
 
 | Upgrade | Postgres | MySQL |
 |---|---|---|
@@ -325,11 +374,13 @@ database has no default for the column. Prisma's `@default(uuid())` generates
 the value in v5.8.14's client, and v5.7.12's client doesn't know the column.
 Every user that v5.7.12 creates breaks.
 
-migcheck missed a break in v5.7.12. v5.7.12 drops `Watchlist.severity` and
+Replay missed a break in v5.7.12. v5.7.12 drops `Watchlist.severity` and
 other `Watchlist` columns, and v5.6.20's watchlist checks filter on
 `severity`. v5.6.20's integration tests and seed script never reach those
-checks, so the run had no queries to replay. This finding comes from reading
-the code, not from a run.
+checks, so the run had no queries to replay. The schema probes flagged
+`severity`, `createdAt`, `createdById`, `updatedAt`, and `updatedById`. The
+source search finds 3 to 6 files in v5.6.20 that mention each column and
+`Watchlist`, such as `packages/features/watchlist/watchlist.repository.ts`.
 
 v5.9.15's migrations add tables, change column types in the tables they
 add, and drop NOT NULL constraints, so migcheck passed it.
@@ -365,3 +416,89 @@ were 36 to 54 statements per run, most of the statements that migcheck
 skipped.
 
 All server tests passed in each run.
+
+## Supabase example
+
+Supabase apps send most queries through PostgREST, which runs each request as
+the signed-in user's database role, so row-level security (RLS) policies
+apply. migcheck ran on Supabase's
+[`nextjs-todo-list`](https://github.com/supabase/supabase/tree/master/examples/todo-list/nextjs-todo-list)
+example to test the setup in [RECIPES.md](RECIPES.md#supabase). The example
+isn't a production app, and its four candidate releases were written for this
+test. These results show that the setup works, not how often migcheck catches
+breaks in Supabase apps.
+
+The runs used the versions that Supabase CLI 2.120.0 runs: the
+`supabase/postgres:17.11.0.004` image, PostgREST v16.4, and Supabase Auth
+v2.197.0. The workload was a test script that signs up two users with
+`supabase-js` and runs the example's queries as each of them: it lists, adds,
+toggles, and deletes todos. Each run replayed 155 statements.
+
+| Release | Migration | Result |
+|---|---|---|
+| `v2-expand` | Adds `todos.priority` | Pass |
+| `v2-rename` | Renames `todos.is_complete` to `done` | Fail |
+| `v2-rls` | Adds lists, and a policy that allows a new todo only in one of the user's lists | Fail |
+| `v2-untested` | Drops `todos.inserted_at`, which only an untested function reads | Pass with a warning |
+
+- `v2-rename` broke 1 statement, the update that toggles a todo. The reads
+  use `select('*')`, so they still work.
+- `v2-rls` broke the 3 inserts, with an RLS error. Replay runs each request as
+  the role PostgREST switched to. A workload that queries the database
+  directly as `postgres` doesn't catch this break, because that role bypasses
+  RLS. `v2-rls` gave the same result on the Postgres 15 image,
+  `supabase/postgres:15.19.0.004`.
+- `v2-untested` passed replay, because the tests never read `inserted_at`. A
+  schema probe flagged the dropped column, and the report named the one file
+  that mentions it, `lib/todos.mjs`.
+
+To reproduce these runs, build the example with
+[`examples/make-supabase-demo.sh`](examples/make-supabase-demo.sh) and run the
+command in [RECIPES.md](RECIPES.md#supabase).
+
+Before 0.5.0, migcheck couldn't run on Supabase's image, because the image
+doesn't make `postgres` a superuser. Replay also skipped every write that
+came through PostgREST.
+
+## Schema probes
+
+The schema probes ran on Plane's 25 migrations, on Cal.com v5.6.20 to v5.7.12,
+and on the upgrades below. On the upgrades that replay failed, the table lists
+only the findings that replay didn't already show.
+
+| Upgrade | Database | Replay | Probe findings |
+|---|---|---|---|
+| Cal.com v5.8.14 to v5.9.15 | Postgres | Pass | None |
+| Bitwarden v2026.4.2 to v2026.5.0 | Postgres | Pass | None |
+| Bitwarden v2026.5.0 to v2026.6.2 | Postgres | Pass | `Send.Data` no longer accepts NULL |
+| Outline v1.8.1 to v1.9.0 | Postgres | Pass | `teams.collaborativeEditing` is dropped |
+| Outline v1.11.0 to v1.12.0 | Postgres | Pass | None |
+| Akkoma v3.19.0 to v3.20.1 | Postgres | Pass | None |
+| Lemmy 1.0.0-beta.1 to 1.0.0-beta.2 | Postgres | Pass | None |
+| n8n 2.44.6 to 2.45.3 | Postgres | Pass | None |
+| BookStack v24.02.3 to v24.05.4 | MySQL | Fail | None |
+| BookStack v25.07.3 to v25.11.6 | MySQL | Fail | `role_permissions.display_name` and `role_permissions.description` are dropped |
+| BookStack v25.11.6 to v25.12.9 | MySQL | Pass | None |
+| BookStack v26.05.5 to v26.09.2 | MySQL | Pass | None |
+| Gitea v1.23.8 to v1.24.7 | MySQL | Fail | None |
+| Gitea v1.24.7 to v1.25.5 | MySQL | Pass | `notice.description` no longer accepts NULL |
+| Ghost v6.69.0 to v6.70.0 | MySQL | Fail | None |
+| Ghost v6.71.0 to v6.72.0 | MySQL | Pass | None |
+
+None of these findings is a confirmed break. They show the limits of a query
+written from the schema:
+
+- `teams.collaborativeEditing` is a contract step. v1.8.1's model no longer
+  declares the column, so dropping it is safe. The report said that no file
+  in v1.8.1 mentions the column outside its migrations.
+- BookStack's migration is named `remove_unused_columns`. In v25.07.3, the
+  only mention of the two columns on the `RolePermission` model is a doc
+  comment, and Eloquent reads them with `SELECT *`, so dropping them is
+  probably safe. The source search can't tell a doc comment from a use.
+- `Send.Data` and `notice.description` existed in the base release and
+  accepted NULL there. The probe inserts a row without them, but the base
+  release might always set them. v1.24.7 writes `notice.description` from a
+  Go string, which is never NULL. These results don't show whether
+  v2026.5.0 ever writes a `Send` without `Data`. The report labels this kind
+  of change "column no longer accepts NULL", apart from new required columns,
+  which every insert from the base release leaves out.

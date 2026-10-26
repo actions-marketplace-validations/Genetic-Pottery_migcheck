@@ -74,6 +74,8 @@ including the following:
 - New `NOT NULL` columns without a database default. The old release's inserts
   don't set them.
 - New constraints that the old release's writes violate.
+- Row-level security policies that the old release's writes violate, when
+  the app switches to the user's role, as Supabase's PostgREST does.
 - Changed column types that the old release's values don't fit.
 
 The `NOT NULL` case is easy to miss in Django. When a migration adds a field
@@ -131,8 +133,8 @@ migcheck --base v1.4.0 --head main \
 ```
 
 For Rails, SQLAlchemy, Go, Node, Prisma, Sequelize, Rust, Elixir, Laravel,
-Entity Framework, and apps that migrate on startup, and for apps that don't read
-`DATABASE_URL`, see [RECIPES.md](RECIPES.md).
+Entity Framework, Supabase, and apps that migrate on startup, and for apps that
+don't read `DATABASE_URL`, see [RECIPES.md](RECIPES.md).
 
 migcheck exits with one of the following codes:
 
@@ -174,6 +176,8 @@ migrations when `SKIP_POST_DEPLOYMENT_MIGRATIONS` is set.
 | `--head-name` | Name to show for `--head` in the result, such as `this pull request`. |
 | `--markdown` | Also write the result as Markdown to this path, for a pull request comment. |
 | `--require-workload-success` | Exit with code `2` if the workload command fails, instead of checking the queries it ran. |
+| `--fail-on-probes` | Exit with code `1` when a schema probe fails, even if every recorded statement still works. |
+| `--no-probes` | Don't generate schema probes. |
 | `--version` | Print migcheck's version and exit. |
 
 ## See it in action
@@ -236,6 +240,7 @@ The action takes the following inputs:
 | `db` | `postgres` or `mysql`. Default: `postgres` |
 | `image` | Database Docker image. Default: `postgres:17-alpine` or `mysql:8.4` |
 | `require-workload-success` | Whether a failing workload command is an error. Default: `false` |
+| `fail-on-probes` | Whether a failing schema probe fails the job. Default: `false` |
 | `working-directory` | Directory of the repository to check. Default: `.` |
 | `comment` | Whether to post a pull request comment. Default: `true` |
 | `comment-key` | Keeps comments separate when a workflow runs migcheck more than once. Default: `default` |
@@ -249,8 +254,10 @@ on them. The result still appears in the job summary.
 
 ## Try the demo
 
-The demo builds a small repository with one base release and three candidate
-releases. Two of the candidates break the base release.
+The demo builds a small repository with one base release and four candidate
+releases. Three of the candidates break the base release. Replay catches two
+of them, and a schema probe catches the third, which the demo's test never
+reaches.
 
 ```sh
 python3 -m venv /tmp/mc-venv
@@ -267,6 +274,10 @@ migcheck --repo /tmp/mc-demo --base v1 --head v2-rename \
 | `v2-expand` | Adds `full_name` next to `name` | `PASS` |
 | `v2-rename` | Renames `name` to `full_name` | `FAIL` |
 | `v2-notnull` | Adds `plan text NOT NULL` with no default | `FAIL` |
+| `v2-untested` | Drops `nickname`, which only untested code uses | `PASS WITH WARNING`, from a schema probe |
+
+For a demo on Supabase, with PostgREST and row-level security, see
+[Supabase](RECIPES.md#supabase) in `RECIPES.md`.
 
 ## How it works
 
@@ -318,13 +329,50 @@ migcheck also accounts for how test runners use the database:
   auto-increment counters as the workload, so inserts get the same keys when
   the workload runs one test at a time.
 
+### Schema probes
+
+Replay checks only the queries the workload made, so it misses breaks in code
+the tests never run. So migcheck also writes probe queries from the schema
+change:
+
+- For each table, view, column, or function that the head release's
+  migrations drop or rename, it writes a query that uses it.
+- For each table where an insert needs a value that it didn't need before,
+  it writes an insert that sets only the columns the base schema requires. It
+  inserts parent rows for the required foreign keys first. The report labels
+  what changed:
+  - "New column requires a value": a new `NOT NULL` column without a database
+    default. Every insert from the base release leaves it out.
+  - "Column lost its default": a `NOT NULL` column whose default was dropped.
+    Every insert from the base release that relied on the default fails.
+  - "Column no longer accepts NULL": a nullable column made `NOT NULL`. The
+    base release might always set it, so the probe sets it when the table has
+    a change of the first two kinds, and leaves it out otherwise.
+
+Probes replay with the recorded queries, on both schemas, and roll back. A
+probe that works on the old schema and fails on the new one is a finding.
+Probes for changes that replay already caught are left out.
+
+A finding shows what might break, not what does, because the base release
+might never run the query. A column that the base release stopped using
+before the head release dropped it is safe to drop. So findings appear in
+their own section of the report, and they add a warning to a pass instead of
+failing it. For each finding, the report lists the base release's files
+outside its migrations that mention the name. For a column, a file must also
+mention its table. To fail the run on findings, use `--fail-on-probes`.
+
 Everything runs locally. The database container listens only on `127.0.0.1`,
 and migcheck removes the container and worktrees when it finishes.
 
 ## Limitations
 
 - migcheck checks only the queries the workload makes. If your tests never
-  touch a table, migcheck can't see it break.
+  touch a table, replay can't see it break. Schema probes cover dropped and
+  renamed tables, columns, and functions, and required columns. They don't
+  cover changes that depend on values, such as a new unique index or a
+  narrower type, or index changes that break an `ON CONFLICT`. On Postgres,
+  probes need version 12 or later. On older versions, migcheck runs without
+  them and says so in the report.
 - migcheck applies migrations to an empty database. A migration that fails or
   locks for a long time on a large production table can pass here.
 - Replay runs one statement at a time. Failures that depend on concurrency
@@ -332,6 +380,9 @@ and migcheck removes the container and worktrees when it finishes.
 - migcheck checks for errors, not wrong results. A query that returns
   different rows on the new schema passes.
 - On Postgres, replay ignores `SAVEPOINT` and `ROLLBACK TO SAVEPOINT`.
+- On Postgres, replay resets the role at the start of each transaction. A
+  role that an app sets once per connection, with `SET ROLE`, doesn't carry
+  into the connection's later transactions.
 - On MySQL, a workload that runs tests in parallel can leave replayed rows
   with different keys than the workload saw. Statements that reference those
   keys then fail on both schemas, and migcheck skips them.
